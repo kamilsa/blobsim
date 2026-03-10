@@ -436,6 +436,7 @@ fn handle_incoming_request(
     // Record outgoing response bytes
     let resp_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
     metrics.record_response_sent(resp_bytes);
+    debug!(resp_bytes, "req-res response sent");
 
     if swarm
         .behaviour_mut()
@@ -484,9 +485,14 @@ fn publish_gossip(
     // Record outgoing gossip bytes
     metrics.record_gossip_sent(topic_str, data.len());
 
-    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-        // PublishError::InsufficientPeers is expected when starting up with no peers yet
-        warn!(topic = %topic_str, error = %e, "gossip publish failed");
+    match swarm.behaviour_mut().gossipsub.publish(topic, data.clone()) {
+        Ok(msg_id) => {
+            debug!(topic = %topic_str, %msg_id, msg_bytes = data.len(), "gossip message published");
+        }
+        Err(e) => {
+            // PublishError::InsufficientPeers is expected when starting up with no peers yet
+            warn!(topic = %topic_str, error = %e, "gossip publish failed");
+        }
     }
 }
 
