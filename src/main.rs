@@ -3,10 +3,12 @@
 //! Parses CLI arguments to assign the node's persona and starts the
 //! networking stack + slot ticker state machine.
 
+mod metrics;
 mod network;
 mod state_machine;
 mod types;
 
+use crate::metrics::BandwidthMetrics;
 use crate::network::{build_swarm, dial_peers, subscribe_all};
 use crate::state_machine::run_node;
 use crate::types::NodePersona;
@@ -76,6 +78,9 @@ async fn main() {
         dial_peers(&mut swarm, &cli.peers);
     }
 
+    // Create bandwidth metrics tracker
+    let mut metrics = BandwidthMetrics::new(cli.persona);
+
     // Run the state machine
-    run_node(cli.persona, &mut swarm, cli.seed, cli.slots).await;
+    run_node(cli.persona, &mut swarm, cli.seed, cli.slots, &mut metrics).await;
 }

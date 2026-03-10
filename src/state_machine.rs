@@ -3,6 +3,7 @@
 //! The state machine drives the swarm event loop and triggers network broadcasts
 //! at the correct phase within each 12-second slot, based on the node's persona.
 
+use crate::metrics::BandwidthMetrics;
 use crate::network::{
     SimBehaviour, TOPIC_CL_BIDS, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
     TOPIC_CL_PTC_ATTESTATION, TOPIC_EL_BLOB_HASH,
@@ -26,6 +27,7 @@ pub async fn run_node(
     swarm: &mut Swarm<SimBehaviour>,
     seed: u64,
     num_slots: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let builder_index = seed; // use seed as a simple unique builder index
@@ -41,7 +43,7 @@ pub async fn run_node(
         // ---------------------------------------------------------------
         if persona == NodePersona::Builder {
             let bid = ExecutionPayloadBid::dummy(slot, builder_index);
-            publish_gossip(swarm, TOPIC_CL_BIDS, &GossipMessage::Bid(bid));
+            publish_gossip(swarm, TOPIC_CL_BIDS, &GossipMessage::Bid(bid), metrics);
             info!(slot, "builder: published bid");
 
             // Also announce blob hashes on EL gossip
@@ -50,12 +52,13 @@ pub async fn run_node(
                 swarm,
                 TOPIC_EL_BLOB_HASH,
                 &GossipMessage::BlobHash(blob_announce),
+                metrics,
             );
             info!(slot, "builder: published blob hash announce");
         }
 
         // Drain events until t=4s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(4), slot).await;
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(4), slot, metrics).await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase
@@ -67,6 +70,7 @@ pub async fn run_node(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,
                 &GossipMessage::Envelope(envelope),
+                metrics,
             );
             info!(slot, "builder: published payload envelope");
 
@@ -77,16 +81,17 @@ pub async fn run_node(
                     swarm,
                     TOPIC_CL_BLOB_SIDECAR,
                     &GossipMessage::Sidecar(sidecar),
+                    metrics,
                 );
             }
             info!(slot, blobs = BLOBS_PER_SLOT, "builder: published blob sidecars");
         }
 
         // Drain events until t=6s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(6), slot).await;
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(6), slot, metrics).await;
 
         // Drain events until t=8s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(8), slot).await;
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(8), slot, metrics).await;
 
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
@@ -104,15 +109,22 @@ pub async fn run_node(
                 swarm,
                 TOPIC_CL_PTC_ATTESTATION,
                 &GossipMessage::PtcAttestation(attestation),
+                metrics,
             );
             info!(slot, "ptc: published payload attestation (Present)");
         }
 
         // Drain events until t=12s (slot boundary)
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(12), slot).await;
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(12), slot, metrics).await;
+
+        // Emit per-slot bandwidth summary
+        metrics.emit_slot_summary(slot);
 
         info!(slot, "=== SLOT END ===");
     }
+
+    // Emit end-of-simulation summary
+    metrics.emit_final_summary(num_slots);
 
     info!("all slots completed, shutting down");
 }
@@ -131,6 +143,7 @@ async fn drain_events_until(
     rng: &mut StdRng,
     deadline: Instant,
     current_slot: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     loop {
         tokio::select! {
@@ -138,7 +151,7 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, persona, rng, event, current_slot);
+                handle_swarm_event(swarm, persona, rng, event, current_slot, metrics);
             }
         }
     }
@@ -151,6 +164,7 @@ fn handle_swarm_event(
     rng: &mut StdRng,
     event: SwarmEvent<SimBehaviourEvent>,
     current_slot: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     match event {
         // -- Gossipsub message received --
@@ -160,11 +174,15 @@ fn handle_swarm_event(
             message,
         })) => {
             let topic = message.topic.to_string();
-            debug!(%propagation_source, %message_id, %topic, "gossip message received");
+            let msg_bytes = message.data.len();
+            debug!(%propagation_source, %message_id, %topic, msg_bytes, "gossip message received");
+
+            // Record bandwidth
+            metrics.record_gossip_received(&topic, msg_bytes);
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(swarm, persona, rng, msg, current_slot);
+                handle_gossip_message(swarm, persona, rng, msg, current_slot, metrics);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
             }
@@ -183,8 +201,12 @@ fn handle_swarm_event(
                 ..
             },
         )) => {
-            debug!(%peer, %request_id, "req-res request received");
-            handle_incoming_request(swarm, persona, request, channel);
+            // Record incoming request bytes
+            let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+            metrics.record_request_received(req_bytes);
+
+            debug!(%peer, %request_id, req_bytes, "req-res request received");
+            handle_incoming_request(swarm, persona, request, channel, metrics);
         }
 
         // -- Request-Response: incoming response --
@@ -199,8 +221,12 @@ fn handle_swarm_event(
                 ..
             },
         )) => {
-            debug!(%peer, %request_id, "req-res response received");
-            handle_incoming_response(persona, response, current_slot);
+            // Record incoming response bytes
+            let resp_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+            metrics.record_response_received(resp_bytes);
+
+            debug!(%peer, %request_id, resp_bytes, "req-res response received");
+            handle_incoming_response(response);
         }
 
         // -- Connection established --
@@ -232,6 +258,7 @@ fn handle_gossip_message(
     rng: &mut StdRng,
     msg: GossipMessage,
     current_slot: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     match msg {
         GossipMessage::Bid(bid) => {
@@ -274,10 +301,10 @@ fn handle_gossip_message(
             // Sampler/Provider react to blob hash announcements
             match persona {
                 NodePersona::Sampler => {
-                    send_custody_requests(swarm, rng, &announce, current_slot);
+                    send_custody_requests(swarm, rng, &announce, current_slot, metrics);
                 }
                 NodePersona::Provider => {
-                    send_full_payload_requests(swarm, &announce, current_slot);
+                    send_full_payload_requests(swarm, &announce, current_slot, metrics);
                 }
                 _ => {}
             }
@@ -295,6 +322,7 @@ fn send_custody_requests(
     rng: &mut StdRng,
     announce: &BlobHashAnnounce,
     _current_slot: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     // Deterministically choose custody columns
     let mut columns: HashSet<u64> = HashSet::new();
@@ -314,6 +342,9 @@ fn send_custody_requests(
             column_indices: column_indices.clone(),
         });
 
+        // Measure request size
+        let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+
         // Send to all connected peers (in practice, to the builder or other holders)
         let peers: Vec<_> = swarm.connected_peers().cloned().collect();
         for peer_id in peers {
@@ -321,8 +352,10 @@ fn send_custody_requests(
                 slot = announce.slot,
                 columns = ?column_indices,
                 %peer_id,
+                req_bytes,
                 "sampler: sending custody cell request"
             );
+            metrics.record_request_sent(req_bytes);
             swarm
                 .behaviour_mut()
                 .req_res
@@ -336,6 +369,7 @@ fn send_full_payload_requests(
     swarm: &mut Swarm<SimBehaviour>,
     announce: &BlobHashAnnounce,
     _current_slot: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     for blob_hash in &announce.blob_hashes {
         let request = SimRequest::FullPayload(FullPayloadRequest {
@@ -343,13 +377,18 @@ fn send_full_payload_requests(
             blob_hash: *blob_hash,
         });
 
+        // Measure request size
+        let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+
         let peers: Vec<_> = swarm.connected_peers().cloned().collect();
         for peer_id in peers {
             info!(
                 slot = announce.slot,
                 %peer_id,
+                req_bytes,
                 "provider: sending full payload request"
             );
+            metrics.record_request_sent(req_bytes);
             swarm
                 .behaviour_mut()
                 .req_res
@@ -364,6 +403,7 @@ fn handle_incoming_request(
     _persona: &NodePersona,
     request: SimRequest,
     channel: request_response::ResponseChannel<SimResponse>,
+    metrics: &mut BandwidthMetrics,
 ) {
     let response = match request {
         SimRequest::CustodyCell(req) => {
@@ -393,6 +433,10 @@ fn handle_incoming_request(
         }
     };
 
+    // Record outgoing response bytes
+    let resp_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+    metrics.record_response_sent(resp_bytes);
+
     if swarm
         .behaviour_mut()
         .req_res
@@ -404,11 +448,7 @@ fn handle_incoming_request(
 }
 
 /// Handle an incoming response (Sampler or Provider side).
-fn handle_incoming_response(
-    _persona: &NodePersona,
-    response: SimResponse,
-    _current_slot: u64,
-) {
+fn handle_incoming_response(response: SimResponse) {
     match response {
         SimResponse::CustodyCell(resp) => {
             info!(
@@ -432,9 +472,17 @@ fn handle_incoming_response(
 // ---------------------------------------------------------------------------
 
 /// Serialize a `GossipMessage` to JSON and publish it on the given topic.
-fn publish_gossip(swarm: &mut Swarm<SimBehaviour>, topic_str: &str, msg: &GossipMessage) {
+fn publish_gossip(
+    swarm: &mut Swarm<SimBehaviour>,
+    topic_str: &str,
+    msg: &GossipMessage,
+    metrics: &mut BandwidthMetrics,
+) {
     let topic = IdentTopic::new(topic_str);
     let data = serde_json::to_vec(msg).expect("serialize gossip message");
+
+    // Record outgoing gossip bytes
+    metrics.record_gossip_sent(topic_str, data.len());
 
     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
         // PublishError::InsufficientPeers is expected when starting up with no peers yet
