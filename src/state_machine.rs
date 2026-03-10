@@ -1,0 +1,447 @@
+//! State machine: 12-second slot ticker with persona-based event logic.
+//!
+//! The state machine drives the swarm event loop and triggers network broadcasts
+//! at the correct phase within each 12-second slot, based on the node's persona.
+
+use crate::network::{
+    SimBehaviour, TOPIC_CL_BIDS, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
+    TOPIC_CL_PTC_ATTESTATION, TOPIC_EL_BLOB_HASH,
+};
+use crate::types::*;
+
+use futures::StreamExt;
+use libp2p::gossipsub::IdentTopic;
+use libp2p::request_response;
+use libp2p::swarm::SwarmEvent;
+use libp2p::Swarm;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::collections::HashSet;
+use tokio::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+/// Run the node's main loop for `num_slots` slots.
+pub async fn run_node(
+    persona: NodePersona,
+    swarm: &mut Swarm<SimBehaviour>,
+    seed: u64,
+    num_slots: u64,
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let builder_index = seed; // use seed as a simple unique builder index
+
+    info!(%persona, num_slots, "starting slot ticker");
+
+    for slot in 0..num_slots {
+        info!(slot, %persona, "=== SLOT START ===");
+        let slot_start = Instant::now();
+
+        // ---------------------------------------------------------------
+        // t=0s — Bid phase
+        // ---------------------------------------------------------------
+        if persona == NodePersona::Builder {
+            let bid = ExecutionPayloadBid::dummy(slot, builder_index);
+            publish_gossip(swarm, TOPIC_CL_BIDS, &GossipMessage::Bid(bid));
+            info!(slot, "builder: published bid");
+
+            // Also announce blob hashes on EL gossip
+            let blob_announce = BlobHashAnnounce::dummy(slot);
+            publish_gossip(
+                swarm,
+                TOPIC_EL_BLOB_HASH,
+                &GossipMessage::BlobHash(blob_announce),
+            );
+            info!(slot, "builder: published blob hash announce");
+        }
+
+        // Drain events until t=4s
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(4), slot).await;
+
+        // ---------------------------------------------------------------
+        // t=4-6s — Payload & blob release phase
+        // ---------------------------------------------------------------
+        if persona == NodePersona::Builder {
+            // Publish signed execution payload envelope
+            let envelope = SignedExecutionPayloadEnvelope::dummy(slot, builder_index);
+            publish_gossip(
+                swarm,
+                TOPIC_CL_PAYLOAD_ENVELOPE,
+                &GossipMessage::Envelope(envelope),
+            );
+            info!(slot, "builder: published payload envelope");
+
+            // Publish blob sidecars
+            for i in 0..BLOBS_PER_SLOT as u64 {
+                let sidecar = BlobSidecar::dummy(slot, i);
+                publish_gossip(
+                    swarm,
+                    TOPIC_CL_BLOB_SIDECAR,
+                    &GossipMessage::Sidecar(sidecar),
+                );
+            }
+            info!(slot, blobs = BLOBS_PER_SLOT, "builder: published blob sidecars");
+        }
+
+        // Drain events until t=6s
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(6), slot).await;
+
+        // Drain events until t=8s
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(8), slot).await;
+
+        // ---------------------------------------------------------------
+        // t=8s — PTC vote phase
+        // ---------------------------------------------------------------
+        if persona == NodePersona::PtcMember {
+            // In a real implementation we'd check if we received enough data.
+            // Here we optimistically vote "Present" as a mock.
+            let attestation = PayloadAttestationMessage {
+                slot,
+                validator_index: seed,
+                payload_status: PayloadStatus::Present,
+                signature: vec![0xFF; 96],
+            };
+            publish_gossip(
+                swarm,
+                TOPIC_CL_PTC_ATTESTATION,
+                &GossipMessage::PtcAttestation(attestation),
+            );
+            info!(slot, "ptc: published payload attestation (Present)");
+        }
+
+        // Drain events until t=12s (slot boundary)
+        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(12), slot).await;
+
+        info!(slot, "=== SLOT END ===");
+    }
+
+    info!("all slots completed, shutting down");
+}
+
+// ---------------------------------------------------------------------------
+// Event drain loop
+// ---------------------------------------------------------------------------
+
+/// Process swarm events until the given deadline.
+///
+/// Uses `tokio::select!` to multiplex between incoming swarm events and
+/// the deadline timer.
+async fn drain_events_until(
+    swarm: &mut Swarm<SimBehaviour>,
+    persona: &NodePersona,
+    rng: &mut StdRng,
+    deadline: Instant,
+    current_slot: u64,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                break;
+            }
+            event = swarm.select_next_some() => {
+                handle_swarm_event(swarm, persona, rng, event, current_slot);
+            }
+        }
+    }
+}
+
+/// Handle a single swarm event, dispatching based on the node's persona.
+fn handle_swarm_event(
+    swarm: &mut Swarm<SimBehaviour>,
+    persona: &NodePersona,
+    rng: &mut StdRng,
+    event: SwarmEvent<SimBehaviourEvent>,
+    current_slot: u64,
+) {
+    match event {
+        // -- Gossipsub message received --
+        SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        })) => {
+            let topic = message.topic.to_string();
+            debug!(%propagation_source, %message_id, %topic, "gossip message received");
+
+            // Deserialize the wrapper
+            if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
+                handle_gossip_message(swarm, persona, rng, msg, current_slot);
+            } else {
+                warn!(%topic, "failed to deserialize gossip message");
+            }
+        }
+
+        // -- Request-Response: incoming request --
+        SwarmEvent::Behaviour(SimBehaviourEvent::ReqRes(
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request_id,
+                        request,
+                        channel,
+                    },
+                ..
+            },
+        )) => {
+            debug!(%peer, %request_id, "req-res request received");
+            handle_incoming_request(swarm, persona, request, channel);
+        }
+
+        // -- Request-Response: incoming response --
+        SwarmEvent::Behaviour(SimBehaviourEvent::ReqRes(
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            },
+        )) => {
+            debug!(%peer, %request_id, "req-res response received");
+            handle_incoming_response(persona, response, current_slot);
+        }
+
+        // -- Connection established --
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            info!(%peer_id, "connection established");
+        }
+
+        // -- Connection closed --
+        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            info!(%peer_id, ?cause, "connection closed");
+        }
+
+        // -- New listen address --
+        SwarmEvent::NewListenAddr { address, .. } => {
+            info!(%address, "listening on");
+        }
+
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gossip message handling
+// ---------------------------------------------------------------------------
+
+fn handle_gossip_message(
+    swarm: &mut Swarm<SimBehaviour>,
+    persona: &NodePersona,
+    rng: &mut StdRng,
+    msg: GossipMessage,
+    current_slot: u64,
+) {
+    match msg {
+        GossipMessage::Bid(bid) => {
+            info!(slot = bid.slot, builder = bid.builder_index, "received bid");
+        }
+
+        GossipMessage::Envelope(env) => {
+            info!(
+                slot = env.slot,
+                builder = env.builder_index,
+                commitments = env.blob_kzg_commitments.len(),
+                "received payload envelope"
+            );
+        }
+
+        GossipMessage::Sidecar(sidecar) => {
+            info!(
+                slot = sidecar.slot,
+                blob_index = sidecar.blob_index,
+                "received blob sidecar"
+            );
+        }
+
+        GossipMessage::PtcAttestation(att) => {
+            info!(
+                slot = att.slot,
+                validator = att.validator_index,
+                status = ?att.payload_status,
+                "received PTC attestation"
+            );
+        }
+
+        GossipMessage::BlobHash(announce) => {
+            info!(
+                slot = announce.slot,
+                hashes = announce.blob_hashes.len(),
+                "received blob hash announce"
+            );
+
+            // Sampler/Provider react to blob hash announcements
+            match persona {
+                NodePersona::Sampler => {
+                    send_custody_requests(swarm, rng, &announce, current_slot);
+                }
+                NodePersona::Provider => {
+                    send_full_payload_requests(swarm, &announce, current_slot);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EL request/response handling
+// ---------------------------------------------------------------------------
+
+/// Sampler: send custody cell requests for a subset of columns + 1 random extra.
+fn send_custody_requests(
+    swarm: &mut Swarm<SimBehaviour>,
+    rng: &mut StdRng,
+    announce: &BlobHashAnnounce,
+    _current_slot: u64,
+) {
+    // Deterministically choose custody columns
+    let mut columns: HashSet<u64> = HashSet::new();
+    while columns.len() < CUSTODY_SUBSET_SIZE {
+        columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
+    }
+    // Add 1 random extra column
+    let extra: u64 = rng.gen_range(0..NUM_CUSTODY_COLUMNS);
+    columns.insert(extra);
+
+    let column_indices: Vec<u64> = columns.into_iter().collect();
+
+    for blob_hash in &announce.blob_hashes {
+        let request = SimRequest::CustodyCell(CustodyCellRequest {
+            slot: announce.slot,
+            blob_hash: *blob_hash,
+            column_indices: column_indices.clone(),
+        });
+
+        // Send to all connected peers (in practice, to the builder or other holders)
+        let peers: Vec<_> = swarm.connected_peers().cloned().collect();
+        for peer_id in peers {
+            info!(
+                slot = announce.slot,
+                columns = ?column_indices,
+                %peer_id,
+                "sampler: sending custody cell request"
+            );
+            swarm
+                .behaviour_mut()
+                .req_res
+                .send_request(&peer_id, request.clone());
+        }
+    }
+}
+
+/// Provider: send full payload requests.
+fn send_full_payload_requests(
+    swarm: &mut Swarm<SimBehaviour>,
+    announce: &BlobHashAnnounce,
+    _current_slot: u64,
+) {
+    for blob_hash in &announce.blob_hashes {
+        let request = SimRequest::FullPayload(FullPayloadRequest {
+            slot: announce.slot,
+            blob_hash: *blob_hash,
+        });
+
+        let peers: Vec<_> = swarm.connected_peers().cloned().collect();
+        for peer_id in peers {
+            info!(
+                slot = announce.slot,
+                %peer_id,
+                "provider: sending full payload request"
+            );
+            swarm
+                .behaviour_mut()
+                .req_res
+                .send_request(&peer_id, request.clone());
+        }
+    }
+}
+
+/// Handle an incoming request (typically on the builder side).
+fn handle_incoming_request(
+    swarm: &mut Swarm<SimBehaviour>,
+    _persona: &NodePersona,
+    request: SimRequest,
+    channel: request_response::ResponseChannel<SimResponse>,
+) {
+    let response = match request {
+        SimRequest::CustodyCell(req) => {
+            info!(
+                slot = req.slot,
+                columns = ?req.column_indices,
+                "handling custody cell request"
+            );
+            let cells: Vec<(u64, Vec<u8>)> = req
+                .column_indices
+                .iter()
+                .map(|&col| (col, vec![0xAA; 64])) // dummy cell data
+                .collect();
+            SimResponse::CustodyCell(CustodyCellResponse {
+                slot: req.slot,
+                blob_hash: req.blob_hash,
+                cells,
+            })
+        }
+        SimRequest::FullPayload(req) => {
+            info!(slot = req.slot, "handling full payload request");
+            SimResponse::FullPayload(FullPayloadResponse {
+                slot: req.slot,
+                blob_hash: req.blob_hash,
+                payload_data: vec![0xBB; DUMMY_BLOB_SIZE],
+            })
+        }
+    };
+
+    if swarm
+        .behaviour_mut()
+        .req_res
+        .send_response(channel, response)
+        .is_err()
+    {
+        warn!("failed to send response (channel closed)");
+    }
+}
+
+/// Handle an incoming response (Sampler or Provider side).
+fn handle_incoming_response(
+    _persona: &NodePersona,
+    response: SimResponse,
+    _current_slot: u64,
+) {
+    match response {
+        SimResponse::CustodyCell(resp) => {
+            info!(
+                slot = resp.slot,
+                cells = resp.cells.len(),
+                "sampler: received custody cells"
+            );
+        }
+        SimResponse::FullPayload(resp) => {
+            info!(
+                slot = resp.slot,
+                payload_size = resp.payload_data.len(),
+                "provider: received full payload"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gossip publish helper
+// ---------------------------------------------------------------------------
+
+/// Serialize a `GossipMessage` to JSON and publish it on the given topic.
+fn publish_gossip(swarm: &mut Swarm<SimBehaviour>, topic_str: &str, msg: &GossipMessage) {
+    let topic = IdentTopic::new(topic_str);
+    let data = serde_json::to_vec(msg).expect("serialize gossip message");
+
+    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
+        // PublishError::InsufficientPeers is expected when starting up with no peers yet
+        warn!(topic = %topic_str, error = %e, "gossip publish failed");
+    }
+}
+
+// Re-export the generated event type for the combined behaviour.
+use crate::network::SimBehaviourEvent;
+use libp2p::gossipsub;
