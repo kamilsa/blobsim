@@ -14,7 +14,9 @@ use std::fmt;
 /// Individual role a node can hold, configured via CLI `--role` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
-    /// Generates bids at t=0 and releases payloads + blobs at t=4-6s.
+    /// Proposes beacon blocks containing the builder's bid at t=0.
+    Proposer,
+    /// Releases payloads + blobs at t=4-6s. Announces blob hashes at t=0.
     Builder,
     /// EIP-8070 sampler (85% of network): requests custody cells + 1 extra.
     Sampler,
@@ -27,6 +29,7 @@ pub enum Role {
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Proposer => write!(f, "proposer"),
             Self::Builder => write!(f, "builder"),
             Self::Sampler => write!(f, "sampler"),
             Self::Provider => write!(f, "provider"),
@@ -39,6 +42,7 @@ impl std::str::FromStr for Role {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "proposer" => Ok(Self::Proposer),
             "builder" => Ok(Self::Builder),
             "sampler" => Ok(Self::Sampler),
             "provider" => Ok(Self::Provider),
@@ -52,6 +56,7 @@ impl std::str::FromStr for Role {
 /// that **Sampler and Provider are mutually exclusive**.
 #[derive(Debug, Clone)]
 pub struct NodeRoles {
+    pub proposer: bool,
     pub builder: bool,
     pub sampler: bool,
     pub provider: bool,
@@ -63,6 +68,7 @@ impl NodeRoles {
     /// Provider are requested.
     pub fn from_roles(roles: &[Role]) -> Self {
         let mut nr = Self {
+            proposer: false,
             builder: false,
             sampler: false,
             provider: false,
@@ -70,6 +76,7 @@ impl NodeRoles {
         };
         for r in roles {
             match r {
+                Role::Proposer => nr.proposer = true,
                 Role::Builder => nr.builder = true,
                 Role::Sampler => nr.sampler = true,
                 Role::Provider => nr.provider = true,
@@ -83,6 +90,9 @@ impl NodeRoles {
         nr
     }
 
+    pub fn is_proposer(&self) -> bool {
+        self.proposer
+    }
     pub fn is_builder(&self) -> bool {
         self.builder
     }
@@ -100,6 +110,9 @@ impl NodeRoles {
 impl fmt::Display for NodeRoles {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
+        if self.proposer {
+            parts.push("proposer");
+        }
         if self.builder {
             parts.push("builder");
         }
@@ -120,7 +133,7 @@ impl fmt::Display for NodeRoles {
 // CL gossip messages
 // ---------------------------------------------------------------------------
 
-/// Builder bid broadcast at t=0s (simplified).
+/// Builder bid (simplified EIP-7732 `ExecutionPayloadBid`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPayloadBid {
     pub slot: u64,
@@ -128,6 +141,28 @@ pub struct ExecutionPayloadBid {
     /// Dummy KZG commitments root (32 bytes).
     pub blob_kzg_commitments_root: [u8; 32],
     pub bid_value_gwei: u64,
+}
+
+/// Builder bid wrapped with a BLS signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedExecutionPayloadBid {
+    pub message: ExecutionPayloadBid,
+    /// Dummy BLS signature (96 bytes).
+    pub signature: Vec<u8>,
+}
+
+/// Simplified beacon block published by the proposer at t=0.
+///
+/// In ePBS (EIP-7732) the beacon block body includes the builder's signed bid
+/// rather than an execution payload. Other fields (attestations, slashings, …)
+/// are omitted for simulation simplicity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedBeaconBlock {
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub signed_execution_payload_bid: SignedExecutionPayloadBid,
+    /// Dummy proposer BLS signature (96 bytes).
+    pub signature: Vec<u8>,
 }
 
 /// Signed execution payload envelope broadcast at t=4-6s.
@@ -226,7 +261,7 @@ pub struct FullPayloadResponse {
 /// Gossipsub message wrapper — serialised to JSON before publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
-    Bid(ExecutionPayloadBid),
+    BeaconBlock(SignedBeaconBlock),
     Envelope(SignedExecutionPayloadEnvelope),
     Sidecar(BlobSidecar),
     PtcAttestation(PayloadAttestationMessage),
@@ -274,6 +309,26 @@ impl ExecutionPayloadBid {
     }
 }
 
+impl SignedExecutionPayloadBid {
+    pub fn dummy(slot: u64, builder_index: u64) -> Self {
+        Self {
+            message: ExecutionPayloadBid::dummy(slot, builder_index),
+            signature: vec![0xDD; 96],
+        }
+    }
+}
+
+impl SignedBeaconBlock {
+    pub fn dummy(slot: u64, proposer_index: u64, builder_index: u64) -> Self {
+        Self {
+            slot,
+            proposer_index,
+            signed_execution_payload_bid: SignedExecutionPayloadBid::dummy(slot, builder_index),
+            signature: vec![0xEE; 96],
+        }
+    }
+}
+
 impl SignedExecutionPayloadEnvelope {
     pub fn dummy(slot: u64, builder_index: u64) -> Self {
         Self {
@@ -309,6 +364,8 @@ impl BlobSidecar {
 }
 
 impl BlobHashAnnounce {
+    // TODO: unused until a role publishes BlobHashAnnounce on the EL topic.
+    #[allow(dead_code)]
     pub fn dummy(slot: u64) -> Self {
         Self {
             slot,

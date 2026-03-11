@@ -1,12 +1,12 @@
-//! State machine: 12-second slot ticker with persona-based event logic.
+//! State machine: 12-second slot ticker with role-based event logic.
 //!
 //! The state machine drives the swarm event loop and triggers network broadcasts
-//! at the correct phase within each 12-second slot, based on the node's persona.
+//! at the correct phase within each 12-second slot, based on the node's roles.
 
 use crate::metrics::BandwidthMetrics;
 use crate::network::{
-    SimBehaviour, TOPIC_CL_BIDS, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
-    TOPIC_CL_PTC_ATTESTATION, TOPIC_EL_BLOB_HASH,
+    SimBehaviour, TOPIC_CL_BEACON_BLOCK, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
+    TOPIC_CL_PTC_ATTESTATION,
 };
 use crate::types::*;
 
@@ -30,7 +30,7 @@ pub async fn run_node(
     metrics: &mut BandwidthMetrics,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
-    let builder_index = seed; // use seed as a simple unique builder index
+    let node_index = seed; // use seed as a simple unique index for this node
 
     info!(%roles, num_slots, "starting slot ticker");
 
@@ -39,33 +39,38 @@ pub async fn run_node(
         let slot_start = Instant::now();
 
         // ---------------------------------------------------------------
-        // t=0s — Bid phase
+        // t=0s — Proposal phase (proposer only)
         // ---------------------------------------------------------------
-        if roles.is_builder() {
-            let bid = ExecutionPayloadBid::dummy(slot, builder_index);
-            publish_gossip(swarm, TOPIC_CL_BIDS, &GossipMessage::Bid(bid), metrics);
-            info!(slot, "builder: published bid");
-
-            // Also announce blob hashes on EL gossip
-            let blob_announce = BlobHashAnnounce::dummy(slot);
+        if roles.is_proposer() {
+            // Proposer creates a beacon block containing the builder's signed bid.
+            // In a real network the proposer would select the winning bid from a
+            // relay; here we use a dummy bid with builder_index = 0.
+            let block = SignedBeaconBlock::dummy(slot, node_index, /*builder_index=*/ 0);
             publish_gossip(
                 swarm,
-                TOPIC_EL_BLOB_HASH,
-                &GossipMessage::BlobHash(blob_announce),
+                TOPIC_CL_BEACON_BLOCK,
+                &GossipMessage::BeaconBlock(block),
                 metrics,
             );
-            info!(slot, "builder: published blob hash announce");
+            info!(slot, "proposer: published beacon block (containing bid)");
         }
 
         // Drain events until t=4s
         drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics).await;
 
         // ---------------------------------------------------------------
-        // t=4-6s — Payload & blob release phase
+        // t=4-6s — Payload & blob release phase (builder only)
+        //
+        // By this point the builder has seen the beacon block (containing
+        // its bid) and knows it was selected. It publishes:
+        //   1. Signed execution payload envelope on CL gossip
+        //   2. Blob sidecars on CL gossip
+        // Blob hash info is already embedded in the envelope's KZG
+        // commitments, so no separate EL announcement is needed.
         // ---------------------------------------------------------------
         if roles.is_builder() {
             // Publish signed execution payload envelope
-            let envelope = SignedExecutionPayloadEnvelope::dummy(slot, builder_index);
+            let envelope = SignedExecutionPayloadEnvelope::dummy(slot, node_index);
             publish_gossip(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,
@@ -261,8 +266,14 @@ fn handle_gossip_message(
     metrics: &mut BandwidthMetrics,
 ) {
     match msg {
-        GossipMessage::Bid(bid) => {
-            info!(slot = bid.slot, builder = bid.builder_index, "received bid");
+        GossipMessage::BeaconBlock(block) => {
+            info!(
+                slot = block.slot,
+                proposer = block.proposer_index,
+                builder = block.signed_execution_payload_bid.message.builder_index,
+                bid_gwei = block.signed_execution_payload_bid.message.bid_value_gwei,
+                "received beacon block"
+            );
         }
 
         GossipMessage::Envelope(env) => {
@@ -298,7 +309,10 @@ fn handle_gossip_message(
                 "received blob hash announce"
             );
 
-            // Sampler/Provider react to blob hash announcements
+            // TODO: BlobHashAnnounce is not currently published by any role.
+            // In a future iteration, samplers should react by fetching only
+            // their custody column cells, and providers should fetch the
+            // entire blob payload.
             if roles.is_sampler() {
                 send_custody_requests(swarm, rng, &announce, current_slot, metrics);
             }

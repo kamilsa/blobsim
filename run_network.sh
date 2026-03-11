@@ -96,10 +96,12 @@ start_node() {
 }
 
 # ── Collect all node ports ───────────────────────────────────────────
-BUILDER_PORT=$BASE_PORT
-ALL_PORTS=("$BUILDER_PORT")
+# Order: proposer, builder, then samplers + providers
+PROPOSER_PORT=$BASE_PORT
+BUILDER_PORT=$((BASE_PORT + 1))
+ALL_PORTS=("$PROPOSER_PORT" "$BUILDER_PORT")
 
-PORT=$((BASE_PORT + 1))
+PORT=$((BASE_PORT + 2))
 for _ in $(seq 1 "$TOTAL"); do
     ALL_PORTS+=("$PORT")
     PORT=$((PORT + 1))
@@ -135,12 +137,17 @@ for p in chosen:
 PTC_SAMPLERS=$(( (PTC * SAMPLERS + TOTAL / 2) / TOTAL ))
 PTC_PROVIDERS=$(( PTC - PTC_SAMPLERS ))
 
+# ── Launch proposer ──────────────────────────────────────────────────
+PROPOSER_PEERS=( $(pick_peers "$PROPOSER_PORT" 1) )
+start_node "proposer" --role proposer --port "$PROPOSER_PORT" --seed 1 --slots "$SLOTS" \
+    "${PROPOSER_PEERS[@]}"
+
 # ── Launch builder ───────────────────────────────────────────────────
-BUILDER_PEERS=( $(pick_peers "$BUILDER_PORT" 1) )
-start_node "builder" --role builder --port "$BUILDER_PORT" --seed 1 --slots "$SLOTS" \
+BUILDER_PEERS=( $(pick_peers "$BUILDER_PORT" 2) )
+start_node "builder" --role builder --port "$BUILDER_PORT" --seed 2 --slots "$SLOTS" \
     "${BUILDER_PEERS[@]}"
 
-PORT=$((BASE_PORT + 1))
+PORT=$((BASE_PORT + 2))
 SEED=100
 
 # ── Launch samplers ──────────────────────────────────────────────────
@@ -174,8 +181,9 @@ for i in $(seq 1 "$PROVIDERS"); do
 done
 
 # ── Summary ──────────────────────────────────────────────────────────
-TOTAL_NODES=$((1 + SAMPLERS + PROVIDERS))
+TOTAL_NODES=$((2 + SAMPLERS + PROVIDERS))
 echo "Network launched: ${TOTAL_NODES} nodes, ${PEERS_PER_NODE} peers/node"
+echo "  1 proposer (port ${PROPOSER_PORT})"
 echo "  1 builder (port ${BUILDER_PORT})"
 echo "  ${SAMPLERS} samplers (${PTC_SAMPLERS} also PTC)"
 echo "  ${PROVIDERS} providers (${PTC_PROVIDERS} also PTC)"

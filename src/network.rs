@@ -17,8 +17,8 @@ use tracing::info;
 // Gossipsub topic constants
 // ---------------------------------------------------------------------------
 
-/// CL topic: builder execution payload bids.
-pub const TOPIC_CL_BIDS: &str = "/cl/bids/1";
+/// CL topic: signed beacon blocks (proposed by the proposer, containing the builder's bid).
+pub const TOPIC_CL_BEACON_BLOCK: &str = "/cl/beacon_block/1";
 /// CL topic: signed execution payload envelopes.
 pub const TOPIC_CL_PAYLOAD_ENVELOPE: &str = "/cl/payload_envelope/1";
 /// CL topic: blob sidecars.
@@ -31,7 +31,7 @@ pub const TOPIC_EL_BLOB_HASH: &str = "/el/blob_hash/1";
 /// All topics a node should subscribe to.
 pub fn all_topics() -> Vec<IdentTopic> {
     vec![
-        IdentTopic::new(TOPIC_CL_BIDS),
+        IdentTopic::new(TOPIC_CL_BEACON_BLOCK),
         IdentTopic::new(TOPIC_CL_PAYLOAD_ENVELOPE),
         IdentTopic::new(TOPIC_CL_BLOB_SIDECAR),
         IdentTopic::new(TOPIC_CL_PTC_ATTESTATION),
