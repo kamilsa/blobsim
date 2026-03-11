@@ -21,6 +21,20 @@ use std::collections::HashSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Per-slot state tracked during event processing.
+struct SlotState {
+    /// Whether we received an execution payload envelope this slot.
+    payload_received: bool,
+}
+
+impl SlotState {
+    fn new() -> Self {
+        Self {
+            payload_received: false,
+        }
+    }
+}
+
 /// Run the node's main loop for `num_slots` slots.
 pub async fn run_node(
     roles: &NodeRoles,
@@ -37,6 +51,7 @@ pub async fn run_node(
     for slot in 0..num_slots {
         info!(slot, %roles, "=== SLOT START ===");
         let slot_start = Instant::now();
+        let mut slot_state = SlotState::new();
 
         // ---------------------------------------------------------------
         // t=0s — Proposal phase (proposer only)
@@ -56,7 +71,7 @@ pub async fn run_node(
         }
 
         // Drain events until t=4s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics, &mut slot_state).await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase (builder only)
@@ -93,21 +108,28 @@ pub async fn run_node(
         }
 
         // Drain events until t=6s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics, &mut slot_state).await;
 
         // Drain events until t=8s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics, &mut slot_state).await;
 
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
+        //
+        // PTC members check whether they received the execution payload
+        // envelope from the builder. If so, they vote Present; otherwise
+        // Absent. The builder itself always considers the payload present.
         // ---------------------------------------------------------------
         if roles.is_ptc_member() {
-            // In a real implementation we'd check if we received enough data.
-            // Here we optimistically vote "Present" as a mock.
+            let payload_status = if slot_state.payload_received || roles.is_builder() {
+                PayloadStatus::Present
+            } else {
+                PayloadStatus::Absent
+            };
             let attestation = PayloadAttestationMessage {
                 slot,
                 validator_index: seed,
-                payload_status: PayloadStatus::Present,
+                payload_status,
                 signature: vec![0xFF; 96],
             };
             publish_gossip(
@@ -116,11 +138,11 @@ pub async fn run_node(
                 &GossipMessage::PtcAttestation(attestation),
                 metrics,
             );
-            info!(slot, "ptc: published payload attestation (Present)");
+            info!(slot, status = ?payload_status, "ptc: published payload attestation");
         }
 
         // Drain events until t=12s (slot boundary)
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics, &mut slot_state).await;
 
         // Emit per-slot bandwidth summary
         metrics.emit_slot_summary(slot);
@@ -149,6 +171,7 @@ async fn drain_events_until(
     deadline: Instant,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
+    slot_state: &mut SlotState,
 ) {
     loop {
         tokio::select! {
@@ -156,7 +179,7 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics);
+                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics, slot_state);
             }
         }
     }
@@ -170,6 +193,7 @@ fn handle_swarm_event(
     event: SwarmEvent<SimBehaviourEvent>,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
+    slot_state: &mut SlotState,
 ) {
     match event {
         // -- Gossipsub message received --
@@ -187,7 +211,7 @@ fn handle_swarm_event(
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics);
+                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics, slot_state);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
             }
@@ -264,6 +288,7 @@ fn handle_gossip_message(
     msg: GossipMessage,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
+    slot_state: &mut SlotState,
 ) {
     match msg {
         GossipMessage::BeaconBlock(block) => {
@@ -283,6 +308,7 @@ fn handle_gossip_message(
                 commitments = env.blob_kzg_commitments.len(),
                 "received payload envelope"
             );
+            slot_state.payload_received = true;
         }
 
         GossipMessage::Sidecar(sidecar) => {
