@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
-// Node persona
+// Node roles
 // ---------------------------------------------------------------------------
 
-/// The role a node plays in the simulation, configured via CLI.
+/// Individual role a node can hold, configured via CLI `--role` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodePersona {
+pub enum Role {
     /// Generates bids at t=0 and releases payloads + blobs at t=4-6s.
     Builder,
     /// EIP-8070 sampler (85% of network): requests custody cells + 1 extra.
@@ -24,7 +24,7 @@ pub enum NodePersona {
     PtcMember,
 }
 
-impl fmt::Display for NodePersona {
+impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Builder => write!(f, "builder"),
@@ -35,7 +35,7 @@ impl fmt::Display for NodePersona {
     }
 }
 
-impl std::str::FromStr for NodePersona {
+impl std::str::FromStr for Role {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
@@ -43,8 +43,76 @@ impl std::str::FromStr for NodePersona {
             "sampler" => Ok(Self::Sampler),
             "provider" => Ok(Self::Provider),
             "ptc" | "ptc_member" | "ptcmember" => Ok(Self::PtcMember),
-            other => Err(format!("unknown persona: {other}")),
+            other => Err(format!("unknown role: {other}")),
         }
+    }
+}
+
+/// Set of roles a single node holds. A node may combine roles freely except
+/// that **Sampler and Provider are mutually exclusive**.
+#[derive(Debug, Clone)]
+pub struct NodeRoles {
+    pub builder: bool,
+    pub sampler: bool,
+    pub provider: bool,
+    pub ptc_member: bool,
+}
+
+impl NodeRoles {
+    /// Build from a list of CLI-provided roles. Panics if both Sampler and
+    /// Provider are requested.
+    pub fn from_roles(roles: &[Role]) -> Self {
+        let mut nr = Self {
+            builder: false,
+            sampler: false,
+            provider: false,
+            ptc_member: false,
+        };
+        for r in roles {
+            match r {
+                Role::Builder => nr.builder = true,
+                Role::Sampler => nr.sampler = true,
+                Role::Provider => nr.provider = true,
+                Role::PtcMember => nr.ptc_member = true,
+            }
+        }
+        assert!(
+            !(nr.sampler && nr.provider),
+            "a node cannot be both sampler and provider"
+        );
+        nr
+    }
+
+    pub fn is_builder(&self) -> bool {
+        self.builder
+    }
+    pub fn is_sampler(&self) -> bool {
+        self.sampler
+    }
+    pub fn is_provider(&self) -> bool {
+        self.provider
+    }
+    pub fn is_ptc_member(&self) -> bool {
+        self.ptc_member
+    }
+}
+
+impl fmt::Display for NodeRoles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if self.builder {
+            parts.push("builder");
+        }
+        if self.sampler {
+            parts.push("sampler");
+        }
+        if self.provider {
+            parts.push("provider");
+        }
+        if self.ptc_member {
+            parts.push("ptc");
+        }
+        write!(f, "{}", parts.join("+"))
     }
 }
 

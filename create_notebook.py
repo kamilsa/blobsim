@@ -63,7 +63,7 @@ def plot_per_second(role, host):
     plt.show()"""
 
 code_summary = """def parse_aggregate_metrics():
-    metric_pattern = re.compile(r\"METRIC slot=(\\d+) persona=(\\w+) el_bytes_sent=(\\d+) el_bytes_received=(\\d+) cl_bytes_sent=(\\d+) cl_bytes_received=(\\d+)\")
+    metric_pattern = re.compile(r\"METRIC slot=(\\d+) roles=(\\S+) el_bytes_sent=(\\d+) el_bytes_received=(\\d+) cl_bytes_sent=(\\d+) cl_bytes_received=(\\d+)\")
     data = []
     data_dir = \"shadow.data/hosts\"
     if not os.path.exists(data_dir): return pd.DataFrame()
@@ -74,20 +74,20 @@ code_summary = """def parse_aggregate_metrics():
                 for line in f:
                     match = metric_pattern.search(line)
                     if match:
-                        slot, persona = int(match.group(1)), match.group(2)
-                        data.append({\"persona\": persona, \"Direction\": \"Incoming\", \"Layer\": \"EL\", \"Bytes\": int(match.group(4)), \"slot\": slot})
-                        data.append({\"persona\": persona, \"Direction\": \"Incoming\", \"Layer\": \"CL\", \"Bytes\": int(match.group(6)), \"slot\": slot})
-                        data.append({\"persona\": persona, \"Direction\": \"Outgoing\", \"Layer\": \"EL\", \"Bytes\": int(match.group(3)), \"slot\": slot})
-                        data.append({\"persona\": persona, \"Direction\": \"Outgoing\", \"Layer\": \"CL\", \"Bytes\": int(match.group(5)), \"slot\": slot})
+                        slot, roles = int(match.group(1)), match.group(2)
+                        data.append({\"roles\": roles, \"Direction\": \"Incoming\", \"Layer\": \"EL\", \"Bytes\": int(match.group(4)), \"slot\": slot})
+                        data.append({\"roles\": roles, \"Direction\": \"Incoming\", \"Layer\": \"CL\", \"Bytes\": int(match.group(6)), \"slot\": slot})
+                        data.append({\"roles\": roles, \"Direction\": \"Outgoing\", \"Layer\": \"EL\", \"Bytes\": int(match.group(3)), \"slot\": slot})
+                        data.append({\"roles\": roles, \"Direction\": \"Outgoing\", \"Layer\": \"CL\", \"Bytes\": int(match.group(5)), \"slot\": slot})
     return pd.DataFrame(data)
 
 def plot_aggregates(df):
     if df.empty: return
     slot1 = df[df[\"slot\"] == 1]
     plt.figure(figsize=(12, 6))
-    per_node = slot1.groupby([\"persona\", \"Direction\"])[\"Bytes\"].mean().reset_index()
+    per_node = slot1.groupby([\"roles\", \"Direction\"])[\"Bytes\"].mean().reset_index()
     per_node[\"KB\"] = per_node[\"Bytes\"] / 1024
-    sns.barplot(data=per_node, x=\"persona\", y=\"KB\", hue=\"Direction\")
+    sns.barplot(data=per_node, x=\"roles\", y=\"KB\", hue=\"Direction\")
     plt.title(\"Average Bandwidth per Node (Slot 1)\")
     plt.ylabel(\"KB\")
     plt.show()"""

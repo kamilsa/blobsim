@@ -11,7 +11,7 @@ mod types;
 use crate::metrics::BandwidthMetrics;
 use crate::network::{build_swarm, dial_peers, subscribe_all};
 use crate::state_machine::run_node;
-use crate::types::NodePersona;
+use crate::types::{NodeRoles, Role};
 
 use clap::Parser;
 use libp2p::Multiaddr;
@@ -25,9 +25,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "blob-sim", version, about)]
 struct Cli {
-    /// Node persona: builder, sampler, provider, ptc
-    #[arg(long)]
-    persona: NodePersona,
+    /// Node role (repeatable): builder, sampler, provider, ptc.
+    /// Sampler and provider are mutually exclusive.
+    #[arg(long = "role", required = true)]
+    roles: Vec<Role>,
 
     /// QUIC listen port (0 = OS-assigned)
     #[arg(long, default_value_t = 0)]
@@ -56,9 +57,10 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+    let roles = NodeRoles::from_roles(&cli.roles);
 
     info!(
-        persona = %cli.persona,
+        roles = %roles,
         port = cli.port,
         seed = cli.seed,
         peers = ?cli.peers,
@@ -79,8 +81,8 @@ async fn main() {
     }
 
     // Create bandwidth metrics tracker
-    let mut metrics = BandwidthMetrics::new(cli.persona);
+    let mut metrics = BandwidthMetrics::new(&roles);
 
     // Run the state machine
-    run_node(cli.persona, &mut swarm, cli.seed, cli.slots, &mut metrics).await;
+    run_node(&roles, &mut swarm, cli.seed, cli.slots, &mut metrics).await;
 }

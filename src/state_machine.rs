@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 /// Run the node's main loop for `num_slots` slots.
 pub async fn run_node(
-    persona: NodePersona,
+    roles: &NodeRoles,
     swarm: &mut Swarm<SimBehaviour>,
     seed: u64,
     num_slots: u64,
@@ -32,16 +32,16 @@ pub async fn run_node(
     let mut rng = StdRng::seed_from_u64(seed);
     let builder_index = seed; // use seed as a simple unique builder index
 
-    info!(%persona, num_slots, "starting slot ticker");
+    info!(%roles, num_slots, "starting slot ticker");
 
     for slot in 0..num_slots {
-        info!(slot, %persona, "=== SLOT START ===");
+        info!(slot, %roles, "=== SLOT START ===");
         let slot_start = Instant::now();
 
         // ---------------------------------------------------------------
         // t=0s — Bid phase
         // ---------------------------------------------------------------
-        if persona == NodePersona::Builder {
+        if roles.is_builder() {
             let bid = ExecutionPayloadBid::dummy(slot, builder_index);
             publish_gossip(swarm, TOPIC_CL_BIDS, &GossipMessage::Bid(bid), metrics);
             info!(slot, "builder: published bid");
@@ -58,12 +58,12 @@ pub async fn run_node(
         }
 
         // Drain events until t=4s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(4), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics).await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase
         // ---------------------------------------------------------------
-        if persona == NodePersona::Builder {
+        if roles.is_builder() {
             // Publish signed execution payload envelope
             let envelope = SignedExecutionPayloadEnvelope::dummy(slot, builder_index);
             publish_gossip(
@@ -88,15 +88,15 @@ pub async fn run_node(
         }
 
         // Drain events until t=6s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(6), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics).await;
 
         // Drain events until t=8s
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(8), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics).await;
 
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
         // ---------------------------------------------------------------
-        if persona == NodePersona::PtcMember {
+        if roles.is_ptc_member() {
             // In a real implementation we'd check if we received enough data.
             // Here we optimistically vote "Present" as a mock.
             let attestation = PayloadAttestationMessage {
@@ -115,7 +115,7 @@ pub async fn run_node(
         }
 
         // Drain events until t=12s (slot boundary)
-        drain_events_until(swarm, &persona, &mut rng, slot_start + Duration::from_secs(12), slot, metrics).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics).await;
 
         // Emit per-slot bandwidth summary
         metrics.emit_slot_summary(slot);
@@ -139,7 +139,7 @@ pub async fn run_node(
 /// the deadline timer.
 async fn drain_events_until(
     swarm: &mut Swarm<SimBehaviour>,
-    persona: &NodePersona,
+    roles: &NodeRoles,
     rng: &mut StdRng,
     deadline: Instant,
     current_slot: u64,
@@ -151,7 +151,7 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, persona, rng, event, current_slot, metrics);
+                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics);
             }
         }
     }
@@ -160,7 +160,7 @@ async fn drain_events_until(
 /// Handle a single swarm event, dispatching based on the node's persona.
 fn handle_swarm_event(
     swarm: &mut Swarm<SimBehaviour>,
-    persona: &NodePersona,
+    roles: &NodeRoles,
     rng: &mut StdRng,
     event: SwarmEvent<SimBehaviourEvent>,
     current_slot: u64,
@@ -182,7 +182,7 @@ fn handle_swarm_event(
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(swarm, persona, rng, msg, current_slot, metrics);
+                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
             }
@@ -206,7 +206,7 @@ fn handle_swarm_event(
             metrics.record_request_received(req_bytes);
 
             debug!(%peer, %request_id, req_bytes, "req-res request received");
-            handle_incoming_request(swarm, persona, request, channel, metrics);
+            handle_incoming_request(swarm, roles, request, channel, metrics);
         }
 
         // -- Request-Response: incoming response --
@@ -254,7 +254,7 @@ fn handle_swarm_event(
 
 fn handle_gossip_message(
     swarm: &mut Swarm<SimBehaviour>,
-    persona: &NodePersona,
+    roles: &NodeRoles,
     rng: &mut StdRng,
     msg: GossipMessage,
     current_slot: u64,
@@ -299,14 +299,11 @@ fn handle_gossip_message(
             );
 
             // Sampler/Provider react to blob hash announcements
-            match persona {
-                NodePersona::Sampler => {
-                    send_custody_requests(swarm, rng, &announce, current_slot, metrics);
-                }
-                NodePersona::Provider => {
-                    send_full_payload_requests(swarm, &announce, current_slot, metrics);
-                }
-                _ => {}
+            if roles.is_sampler() {
+                send_custody_requests(swarm, rng, &announce, current_slot, metrics);
+            }
+            if roles.is_provider() {
+                send_full_payload_requests(swarm, &announce, current_slot, metrics);
             }
         }
     }
@@ -400,7 +397,7 @@ fn send_full_payload_requests(
 /// Handle an incoming request (typically on the builder side).
 fn handle_incoming_request(
     swarm: &mut Swarm<SimBehaviour>,
-    _persona: &NodePersona,
+    _roles: &NodeRoles,
     request: SimRequest,
     channel: request_response::ResponseChannel<SimResponse>,
     metrics: &mut BandwidthMetrics,

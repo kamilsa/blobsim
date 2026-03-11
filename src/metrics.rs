@@ -4,12 +4,12 @@
 //! split by sent/received. Emits structured log lines parseable by
 //! Shadow post-processing scripts.
 
-use crate::types::NodePersona;
+use crate::types::NodeRoles;
 use tracing::info;
 
 /// Per-node bandwidth counters.
 pub struct BandwidthMetrics {
-    persona: NodePersona,
+    roles_label: String,
 
     // -- Per-slot counters (reset each slot) --
     el_bytes_sent: u64,
@@ -31,10 +31,10 @@ pub struct BandwidthMetrics {
 }
 
 impl BandwidthMetrics {
-    /// Create a new metrics tracker for the given persona.
-    pub fn new(persona: NodePersona) -> Self {
+    /// Create a new metrics tracker for the given roles.
+    pub fn new(roles: &NodeRoles) -> Self {
         Self {
-            persona,
+            roles_label: roles.to_string(),
             el_bytes_sent: 0,
             el_bytes_received: 0,
             cl_bytes_sent: 0,
@@ -106,13 +106,13 @@ impl BandwidthMetrics {
     pub fn emit_slot_summary(&mut self, slot: u64) {
         info!(
             target: "metrics",
-            "METRIC slot={} persona={} el_bytes_sent={} el_bytes_received={} \
+            "METRIC slot={} roles={} el_bytes_sent={} el_bytes_received={} \
              cl_bytes_sent={} cl_bytes_received={} \
              el_requests_sent={} el_responses_received={} \
              el_requests_received={} el_responses_sent={} \
              gossip_sent={} gossip_received={}",
             slot,
-            self.persona,
+            self.roles_label,
             self.el_bytes_sent,
             self.el_bytes_received,
             self.cl_bytes_sent,
@@ -169,12 +169,12 @@ impl BandwidthMetrics {
 
         info!(
             target: "metrics",
-            "SUMMARY persona={} slots={} \
+            "SUMMARY roles={} slots={} \
              total_el_bytes_sent={} total_el_bytes_received={} \
              total_cl_bytes_sent={} total_cl_bytes_received={} \
              avg_el_sent_per_slot={} avg_el_recv_per_slot={} \
              avg_cl_sent_per_slot={} avg_cl_recv_per_slot={}",
-            self.persona,
+            self.roles_label,
             num_slots,
             self.total_el_bytes_sent,
             self.total_el_bytes_received,
