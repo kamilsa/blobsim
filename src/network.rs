@@ -88,8 +88,17 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
     info!(%local_peer_id, "building swarm");
 
     // -- Gossipsub --
+    // Ethereum Mainnet Gossipsub parameters:
+    // D=8, D_low=6, D_high=12, D_lazy=6
+    // Heartbeat=700ms, FanoutTTL=60s, HistoryLength=5, HistoryGossip=3
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(1))
+        .heartbeat_interval(Duration::from_millis(700)) // Standard is 700ms
+        .mesh_n_low(6)
+        .mesh_n(8)
+        .mesh_n_high(12)
+        .gossip_lazy(6)
+        .history_length(5)
+        .history_gossip(3)
         .validation_mode(gossipsub::ValidationMode::Permissive)
         .build()
         .expect("valid gossipsub config");
