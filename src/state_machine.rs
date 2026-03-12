@@ -220,7 +220,7 @@ fn handle_swarm_event(
                 .count();
             if forward_peers > 0 {
                 let forwarded_bytes = forward_peers * msg_bytes;
-                debug!(%topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
+                debug!(%message_id, %topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
                 metrics.record_gossip_forwarded(&topic, forwarded_bytes);
             }
 

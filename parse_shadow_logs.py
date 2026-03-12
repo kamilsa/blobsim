@@ -209,6 +209,11 @@ def parse_logs(data_dir, host_to_node, nodes_geo):
         }
 
     # Second pass: traffic correlation
+    # msg_id -> [(peer_id, arrival_time_ms)]
+    msg_receptions = {}
+    # msg_id -> [(source_peer_id, forward_time_ms)]
+    msg_forwards = {}
+
     for host_dir in glob.glob(os.path.join(data_dir, 'hosts', '*')):
         hostname = os.path.basename(host_dir)
         stdout_path = os.path.join(host_dir, 'blob-sim.1000.stdout')
@@ -219,13 +224,11 @@ def parse_logs(data_dir, host_to_node, nodes_geo):
         with open(stdout_path, 'r') as f:
             for line in f:
                 line = strip_ansi(line)
-                # Need local_peer_id for this host
                 if not local_peer_id:
                     peer_match = re.search(r"local_peer_id=([a-zA-Z0-9]+)", line)
                     if peer_match: local_peer_id = peer_match.group(1)
                     continue
 
-                # Parse timestamp
                 time_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z", line)
                 if not time_match: continue
                 
@@ -253,23 +256,49 @@ def parse_logs(data_dir, host_to_node, nodes_geo):
                         msg_id = msg_id_match.group(1)
                         topic = topic_match.group(1)
                         
-                        start_time = ts_ms - 50 # Default travel time
-                        if msg_id in msg_sources:
-                            orig_pub, pub_time, _ = msg_sources[msg_id]
-                            if source_peer == orig_pub:
-                                start_time = pub_time
+                        if msg_id not in msg_receptions: msg_receptions[msg_id] = []
+                        msg_receptions[msg_id].append((local_peer_id, ts_ms, source_peer, topic))
 
-                        base_topic = '/'.join(topic.split('/')[:3])
-                        color = TOPIC_COLORS.get(base_topic, TOPIC_COLORS["Default"])
-                        
-                        traffic_data.append({
-                            "source_id": source_peer,
-                            "target_id": local_peer_id,
-                            "start_time_ms": start_time,
-                            "arrival_time_ms": ts_ms,
-                            "topic": topic,
-                            "color": color
-                        })
+                # Check for forwarding (new log)
+                if "gossip message forwarded" in line:
+                    msg_id_match = re.search(r"message_id=([^ ]+)", line)
+                    if msg_id_match:
+                        msg_id = msg_id_match.group(1)
+                        if msg_id not in msg_forwards: msg_forwards[msg_id] = []
+                        msg_forwards[msg_id].append((local_peer_id, ts_ms))
+
+    # Now reconcile all events into traffic.json
+    for msg_id, receptions in msg_receptions.items():
+        for target_peer, arrival_time, source_peer, topic in receptions:
+            # The log tells us exactly who the propagation_source was for this reception
+            # We just need to find the timestamp when the source sent/forwarded it
+            
+            start_time = arrival_time - 50 # Default
+            
+            # Case 1: Was it the original publisher?
+            if msg_id in msg_sources:
+                orig_pub, pub_time, _ = msg_sources[msg_id]
+                if source_peer == orig_pub:
+                    start_time = pub_time
+            
+            # Case 2: Was it forwarded by someone?
+            if msg_id in msg_forwards:
+                for fwd_peer, fwd_time in msg_forwards[msg_id]:
+                    if fwd_peer == source_peer:
+                        start_time = fwd_time
+                        break
+
+            base_topic = '/'.join(topic.split('/')[:3])
+            color = TOPIC_COLORS.get(base_topic, TOPIC_COLORS["Default"])
+            
+            traffic_data.append({
+                "source_id": source_peer,
+                "target_id": target_peer,
+                "start_time_ms": start_time,
+                "arrival_time_ms": arrival_time,
+                "topic": topic,
+                "color": color
+            })
 
     return list(nodes_data.values()), traffic_data
 
