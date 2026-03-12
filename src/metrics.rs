@@ -22,6 +22,7 @@ pub struct BandwidthMetrics {
     el_responses_sent: u64,
     gossip_messages_sent: u64,
     gossip_messages_received: u64,
+    gossip_messages_forwarded: u64,
 
     // -- Cumulative totals --
     total_el_bytes_sent: u64,
@@ -45,6 +46,7 @@ impl BandwidthMetrics {
             el_responses_sent: 0,
             gossip_messages_sent: 0,
             gossip_messages_received: 0,
+            gossip_messages_forwarded: 0,
             total_el_bytes_sent: 0,
             total_el_bytes_received: 0,
             total_cl_bytes_sent: 0,
@@ -74,6 +76,18 @@ impl BandwidthMetrics {
             self.cl_bytes_received += bytes;
         }
         self.gossip_messages_received += 1;
+    }
+
+    /// Record a gossip message forwarded to mesh peers (outgoing bandwidth).
+    /// Routes to CL or EL based on topic prefix.
+    pub fn record_gossip_forwarded(&mut self, topic: &str, bytes: usize) {
+        let bytes = bytes as u64;
+        if topic.starts_with("/el/") {
+            self.el_bytes_sent += bytes;
+        } else {
+            self.cl_bytes_sent += bytes;
+        }
+        self.gossip_messages_forwarded += 1;
     }
 
     /// Record an EL request-response request sent (Sampler/Provider → peer).
@@ -110,7 +124,7 @@ impl BandwidthMetrics {
              cl_bytes_sent={} cl_bytes_received={} \
              el_requests_sent={} el_responses_received={} \
              el_requests_received={} el_responses_sent={} \
-             gossip_sent={} gossip_received={}",
+             gossip_sent={} gossip_received={} gossip_forwarded={}",
             slot,
             self.roles_label,
             self.el_bytes_sent,
@@ -123,6 +137,7 @@ impl BandwidthMetrics {
             self.el_responses_sent,
             self.gossip_messages_sent,
             self.gossip_messages_received,
+            self.gossip_messages_forwarded,
         );
 
         // Accumulate into totals
@@ -142,6 +157,7 @@ impl BandwidthMetrics {
         self.el_responses_sent = 0;
         self.gossip_messages_sent = 0;
         self.gossip_messages_received = 0;
+        self.gossip_messages_forwarded = 0;
     }
 
     /// Emit a structured end-of-simulation summary log line.

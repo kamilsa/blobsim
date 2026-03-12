@@ -206,8 +206,23 @@ fn handle_swarm_event(
             let msg_bytes = message.data.len();
             debug!(%propagation_source, %message_id, %topic, msg_bytes, "gossip message received");
 
-            // Record bandwidth
+            // Record incoming bandwidth
             metrics.record_gossip_received(&topic, msg_bytes);
+
+            // Gossipsub will automatically forward this message to all other
+            // mesh peers on the topic (excluding the propagation source). Count
+            // them so we can log and account for the outgoing forwarding bandwidth.
+            let forward_peers = swarm
+                .behaviour()
+                .gossipsub
+                .mesh_peers(&message.topic)
+                .filter(|p| *p != &propagation_source)
+                .count();
+            if forward_peers > 0 {
+                let forwarded_bytes = forward_peers * msg_bytes;
+                debug!(%topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
+                metrics.record_gossip_forwarded(&topic, forwarded_bytes);
+            }
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
