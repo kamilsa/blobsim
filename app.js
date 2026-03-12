@@ -4,6 +4,7 @@ let nodes = [];
 let traffic = [];
 let currentTime = 0;
 let isPaused = false;
+let playbackSpeed = 1.0;
 let lastTimestamp = 0;
 let hoveredNodeId = null;
 let visibleRoles = new Set(['Builder', 'Proposer', 'PTC', 'Sampler', 'Provider']);
@@ -11,6 +12,7 @@ let visibleTopics = new Set(['/cl/ptc_attestation', '/cl/payload_envelope', '/cl
 
 const slider = document.getElementById('slider');
 const playBtn = document.getElementById('play-btn');
+const speedSelect = document.getElementById('speed-select');
 const timeDisplay = document.getElementById('time-display');
 
 const deckgl = new DeckGL({
@@ -194,7 +196,7 @@ function animate(timestamp) {
   lastTimestamp = timestamp;
 
   if (!isPaused) {
-    currentTime += delta;
+    currentTime += delta * playbackSpeed;
     if (currentTime > 12000) currentTime = 0;
     
     slider.value = currentTime;
@@ -215,6 +217,10 @@ playBtn.onclick = () => {
   isPaused = !isPaused;
   playBtn.innerText = isPaused ? 'Play' : 'Pause';
   render();
+};
+
+speedSelect.onchange = (e) => {
+    playbackSpeed = parseFloat(e.target.value);
 };
 
 loadData();
