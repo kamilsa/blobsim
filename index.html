@@ -30,16 +30,18 @@
 <body>
     <div id="legend">
         <h3>Nodes</h3>
-        <div class="legend-item"><div class="dot" style="background: rgb(147, 112, 219)"></div>Builder</div>
-        <div class="legend-item"><div class="dot" style="background: rgb(255, 69, 0)"></div>Proposer</div>
-        <div class="legend-item"><div class="dot" style="background: rgb(255, 215, 0)"></div>PTC Member</div>
-        <div class="legend-item"><div class="dot" style="background: rgb(30, 144, 255)"></div>Sampler</div>
-        <div class="legend-item"><div class="dot" style="background: rgb(0, 191, 255)"></div>Provider</div>
+        <div class="legend-item" data-role="Builder" id="filter-Builder"><div class="dot" style="background: rgb(147, 112, 219)"></div>Builder</div>
+        <div class="legend-item" data-role="Proposer" id="filter-Proposer"><div class="dot" style="background: rgb(255, 69, 0)"></div>Proposer</div>
+        <div class="legend-item" data-role="PTC" id="filter-PTC"><div class="dot" style="background: rgb(255, 215, 0)"></div>PTC Member</div>
+        <div class="legend-item" data-role="Sampler" id="filter-Sampler"><div class="dot" style="background: rgb(30, 144, 255)"></div>Sampler</div>
+        <div class="legend-item" data-role="Provider" id="filter-Provider"><div class="dot" style="background: rgb(0, 191, 255)"></div>Provider</div>
         
         <h3 style="margin-top: 15px;">Traffic</h3>
-        <div class="legend-item"><div class="line" style="background: rgb(0, 255, 255)"></div>PTC Attestation</div>
-        <div class="legend-item"><div class="line" style="background: rgb(255, 0, 255)"></div>Payload Envelope</div>
-        <div class="legend-item"><div class="line" style="background: rgb(0, 255, 0)"></div>Blob Sidecar</div>
+        <div class="legend-item" data-topic="/cl/ptc_attestation"><div class="line" style="background: rgb(0, 255, 255)"></div>PTC Attestation</div>
+        <div class="legend-item" data-topic="/cl/payload_envelope"><div class="line" style="background: rgb(255, 0, 255)"></div>Payload Envelope</div>
+        <div class="legend-item" data-topic="/cl/blob_sidecar"><div class="line" style="background: rgb(0, 255, 0)"></div>Blob Sidecar</div>
+        <div class="legend-item" data-topic="/cl/beacon_block"><div class="line" style="background: rgb(255, 255, 255)"></div>Beacon Block</div>
+        <div class="legend-item" data-topic="/cl/bids"><div class="line" style="background: rgb(255, 165, 0)"></div>Builder Bids</div>
     </div>
 
     <div id="ui">
