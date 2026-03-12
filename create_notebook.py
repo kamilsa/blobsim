@@ -82,7 +82,7 @@ def parse_detailed_metrics(host, target_slot=1):
             bytes_match = re.search(r"(msg_bytes|req_bytes|resp_bytes)=(\d+)", line)
             if bytes_match:
                 size = int(bytes_match.group(2))
-                if "published" in line or "sending" in line or "response sent" in line:
+                if "published" in line or "sending" in line or "response sent" in line or "forwarded" in line:
                     direction = "Outgoing"
                 else:
                     direction = "Incoming"
