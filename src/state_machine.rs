@@ -11,7 +11,7 @@ use crate::network::{
 use crate::types::*;
 
 use futures::StreamExt;
-use libp2p::gossipsub::IdentTopic;
+use libp2p::gossipsub::{self, IdentTopic, MessageAcceptance};
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
@@ -116,20 +116,16 @@ pub async fn run_node(
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
         //
-        // PTC members check whether they received the execution payload
-        // envelope from the builder. If so, they vote Present; otherwise
-        // Absent. The builder itself always considers the payload present.
+        // PTC members only attest when they have received the execution
+        // payload envelope from the builder during this slot. If no
+        // payload arrived, the PTC member stays silent (no Absent vote).
+        // The builder itself always considers the payload present.
         // ---------------------------------------------------------------
-        if roles.is_ptc_member() {
-            let payload_status = if slot_state.payload_received || roles.is_builder() {
-                PayloadStatus::Present
-            } else {
-                PayloadStatus::Absent
-            };
+        if roles.is_ptc_member() && (slot_state.payload_received || roles.is_builder()) {
             let attestation = PayloadAttestationMessage {
                 slot,
                 validator_index: seed,
-                payload_status,
+                payload_status: PayloadStatus::Present,
                 signature: vec![0xFF; 96],
             };
             publish_gossip(
@@ -138,7 +134,9 @@ pub async fn run_node(
                 &GossipMessage::PtcAttestation(attestation),
                 metrics,
             );
-            info!(slot, status = ?payload_status, "ptc: published payload attestation");
+            info!(slot, "ptc: published payload attestation (Present)");
+        } else if roles.is_ptc_member() {
+            info!(slot, "ptc: no payload received, skipping attestation");
         }
 
         // Drain events until t=12s (slot boundary)
@@ -209,20 +207,43 @@ fn handle_swarm_event(
             // Record incoming bandwidth
             metrics.record_gossip_received(&topic, msg_bytes);
 
-            // Gossipsub will automatically forward this message to all other
-            // mesh peers on the topic (excluding the propagation source). Count
-            // them so we can log and account for the outgoing forwarding bandwidth.
-            let forward_peers = swarm
-                .behaviour()
-                .gossipsub
-                .mesh_peers(&message.topic)
-                .filter(|p| *p != &propagation_source)
-                .count();
-            if forward_peers > 0 {
-                let forwarded_bytes = forward_peers * msg_bytes;
-                debug!(%message_id, %topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
-                metrics.record_gossip_forwarded(&topic, forwarded_bytes);
+            // Determine whether to accept (forward) or ignore this message.
+            // PTC members suppress PTC attestation forwarding until they have
+            // received the execution payload envelope for the current slot.
+            let is_ptc_attestation = topic == TOPIC_CL_PTC_ATTESTATION;
+            let suppress = is_ptc_attestation
+                && roles.is_ptc_member()
+                && !slot_state.payload_received;
+
+            let acceptance = if suppress {
+                debug!(%topic, "suppressing PTC attestation forwarding (no payload yet)");
+                MessageAcceptance::Ignore
+            } else {
+                MessageAcceptance::Accept
+            };
+
+            // Count forwarding bandwidth (only when we actually forward).
+            if !suppress {
+                let forward_peers = swarm
+                    .behaviour()
+                    .gossipsub
+                    .mesh_peers(&message.topic)
+                    .filter(|p| *p != &propagation_source)
+                    .count();
+                if forward_peers > 0 {
+                    let forwarded_bytes = forward_peers * msg_bytes;
+                    debug!(%message_id, %topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
+                    metrics.record_gossip_forwarded(&topic, forwarded_bytes);
+                }
             }
+
+            // Tell gossipsub whether to propagate.
+            let msg_id_clone = message_id.clone();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(&msg_id_clone, &propagation_source, acceptance)
+                .ok();
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
@@ -323,7 +344,9 @@ fn handle_gossip_message(
                 commitments = env.blob_kzg_commitments.len(),
                 "received payload envelope"
             );
-            slot_state.payload_received = true;
+            if env.slot == current_slot {
+                slot_state.payload_received = true;
+            }
         }
 
         GossipMessage::Sidecar(sidecar) => {
@@ -550,4 +573,3 @@ fn publish_gossip(
 
 // Re-export the generated event type for the combined behaviour.
 use crate::network::SimBehaviourEvent;
-use libp2p::gossipsub;

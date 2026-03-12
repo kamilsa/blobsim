@@ -100,7 +100,8 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
         .history_length(5)
         .history_gossip(3)
         .validation_mode(gossipsub::ValidationMode::Permissive)
-        .build()
+            .validate_messages()
+            .build()
         .expect("valid gossipsub config");
 
     let gossipsub = gossipsub::Behaviour::new(
