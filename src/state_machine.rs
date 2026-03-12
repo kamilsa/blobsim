@@ -11,7 +11,7 @@ use crate::network::{
 use crate::types::*;
 
 use futures::StreamExt;
-use libp2p::gossipsub::IdentTopic;
+use libp2p::gossipsub::{self, IdentTopic, MessageAcceptance};
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
@@ -21,17 +21,27 @@ use std::collections::HashSet;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Per-slot state tracked during event processing.
-struct SlotState {
-    /// Whether we received an execution payload envelope this slot.
-    payload_received: bool,
+/// Cross-slot state that persists across slot boundaries.
+///
+/// Tracks the slot number of the most recently received execution payload
+/// envelope. This must survive slot resets because in Shadow nodes start at
+/// different times — the envelope for slot N may arrive while the local
+/// node is still in its own slot N-1.
+struct NodeState {
+    /// Slot number of the last received execution payload envelope, if any.
+    last_received_envelope_slot: Option<u64>,
 }
 
-impl SlotState {
+impl NodeState {
     fn new() -> Self {
         Self {
-            payload_received: false,
+            last_received_envelope_slot: None,
         }
+    }
+
+    /// Returns true if we have received an envelope for the given slot.
+    fn has_payload_for_slot(&self, slot: u64) -> bool {
+        self.last_received_envelope_slot == Some(slot)
     }
 }
 
@@ -45,13 +55,13 @@ pub async fn run_node(
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
+    let mut node_state = NodeState::new();
 
     info!(%roles, num_slots, "starting slot ticker");
 
     for slot in 0..num_slots {
         info!(slot, %roles, "=== SLOT START ===");
         let slot_start = Instant::now();
-        let mut slot_state = SlotState::new();
 
         // ---------------------------------------------------------------
         // t=0s — Proposal phase (proposer only)
@@ -71,7 +81,7 @@ pub async fn run_node(
         }
 
         // Drain events until t=4s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics, &mut slot_state).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics, &mut node_state).await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase (builder only)
@@ -108,28 +118,24 @@ pub async fn run_node(
         }
 
         // Drain events until t=6s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics, &mut slot_state).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics, &mut node_state).await;
 
         // Drain events until t=8s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics, &mut slot_state).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics, &mut node_state).await;
 
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
         //
-        // PTC members check whether they received the execution payload
-        // envelope from the builder. If so, they vote Present; otherwise
-        // Absent. The builder itself always considers the payload present.
+        // PTC members only attest when they have received the execution
+        // payload envelope from the builder during this slot. If no
+        // payload arrived, the PTC member stays silent (no Absent vote).
+        // The builder itself always considers the payload present.
         // ---------------------------------------------------------------
-        if roles.is_ptc_member() {
-            let payload_status = if slot_state.payload_received || roles.is_builder() {
-                PayloadStatus::Present
-            } else {
-                PayloadStatus::Absent
-            };
+        if roles.is_ptc_member() && (node_state.has_payload_for_slot(slot) || roles.is_builder()) {
             let attestation = PayloadAttestationMessage {
                 slot,
                 validator_index: seed,
-                payload_status,
+                payload_status: PayloadStatus::Present,
                 signature: vec![0xFF; 96],
             };
             publish_gossip(
@@ -138,11 +144,13 @@ pub async fn run_node(
                 &GossipMessage::PtcAttestation(attestation),
                 metrics,
             );
-            info!(slot, status = ?payload_status, "ptc: published payload attestation");
+            info!(slot, "ptc: published payload attestation (Present)");
+        } else if roles.is_ptc_member() {
+            info!(slot, "ptc: no payload received, skipping attestation");
         }
 
         // Drain events until t=12s (slot boundary)
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics, &mut slot_state).await;
+        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics, &mut node_state).await;
 
         // Emit per-slot bandwidth summary
         metrics.emit_slot_summary(slot);
@@ -171,7 +179,7 @@ async fn drain_events_until(
     deadline: Instant,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
+    node_state: &mut NodeState,
 ) {
     loop {
         tokio::select! {
@@ -179,7 +187,7 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics, slot_state);
+                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics, node_state);
             }
         }
     }
@@ -193,7 +201,7 @@ fn handle_swarm_event(
     event: SwarmEvent<SimBehaviourEvent>,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
+    node_state: &mut NodeState,
 ) {
     match event {
         // -- Gossipsub message received --
@@ -209,24 +217,54 @@ fn handle_swarm_event(
             // Record incoming bandwidth
             metrics.record_gossip_received(&topic, msg_bytes);
 
-            // Gossipsub will automatically forward this message to all other
-            // mesh peers on the topic (excluding the propagation source). Count
-            // them so we can log and account for the outgoing forwarding bandwidth.
-            let forward_peers = swarm
-                .behaviour()
-                .gossipsub
-                .mesh_peers(&message.topic)
-                .filter(|p| *p != &propagation_source)
-                .count();
-            if forward_peers > 0 {
-                let forwarded_bytes = forward_peers * msg_bytes;
-                debug!(%topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
-                metrics.record_gossip_forwarded(&topic, forwarded_bytes);
+            // Deserialize first so we can make slot-aware forwarding decisions.
+            let parsed = serde_json::from_slice::<GossipMessage>(&message.data);
+
+            // PTC members suppress forwarding of attestations for slots whose
+            // execution payload envelope has not been received yet.
+            let suppress = match &parsed {
+                Ok(GossipMessage::PtcAttestation(att))
+                    if roles.is_ptc_member()
+                        && !node_state.has_payload_for_slot(att.slot) =>
+                {
+                    debug!(att_slot = att.slot, %topic,
+                        "suppressing PTC attestation forwarding (no payload for this slot)");
+                    true
+                }
+                _ => false,
+            };
+
+            let acceptance = if suppress {
+                MessageAcceptance::Ignore
+            } else {
+                MessageAcceptance::Accept
+            };
+
+            // Count forwarding bandwidth (only when we actually forward).
+            if !suppress {
+                let forward_peers = swarm
+                    .behaviour()
+                    .gossipsub
+                    .mesh_peers(&message.topic)
+                    .filter(|p| *p != &propagation_source)
+                    .count();
+                if forward_peers > 0 {
+                    let forwarded_bytes = forward_peers * msg_bytes;
+                    debug!(%topic, forward_peers, msg_bytes, forwarded_bytes, "gossip message forwarded");
+                    metrics.record_gossip_forwarded(&topic, forwarded_bytes);
+                }
             }
 
-            // Deserialize the wrapper
-            if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics, slot_state);
+            // Tell gossipsub whether to propagate.
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(&message_id, &propagation_source, acceptance)
+                .ok();
+
+            // Process the deserialized message.
+            if let Ok(msg) = parsed {
+                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics, node_state);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
             }
@@ -303,7 +341,7 @@ fn handle_gossip_message(
     msg: GossipMessage,
     current_slot: u64,
     metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
+    node_state: &mut NodeState,
 ) {
     match msg {
         GossipMessage::BeaconBlock(block) => {
@@ -323,7 +361,7 @@ fn handle_gossip_message(
                 commitments = env.blob_kzg_commitments.len(),
                 "received payload envelope"
             );
-            slot_state.payload_received = true;
+            node_state.last_received_envelope_slot = Some(env.slot);
         }
 
         GossipMessage::Sidecar(sidecar) => {
@@ -550,4 +588,3 @@ fn publish_gossip(
 
 // Re-export the generated event type for the combined behaviour.
 use crate::network::SimBehaviourEvent;
-use libp2p::gossipsub;
