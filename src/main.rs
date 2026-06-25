@@ -3,11 +3,13 @@
 //! Parses CLI arguments to assign the node's persona and starts the
 //! networking stack + slot ticker state machine.
 
+mod el_net;
 mod metrics;
 mod network;
 mod state_machine;
 mod types;
 
+use crate::el_net::spawn_el_network;
 use crate::metrics::BandwidthMetrics;
 use crate::network::{build_swarm, dial_peers, subscribe_all};
 use crate::state_machine::run_node;
@@ -15,6 +17,7 @@ use crate::types::{NodeRoles, Role};
 
 use clap::Parser;
 use libp2p::Multiaddr;
+use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -30,17 +33,25 @@ struct Cli {
     #[arg(long = "role", required = true)]
     roles: Vec<Role>,
 
-    /// QUIC listen port (0 = OS-assigned)
+    /// CL QUIC listen port (0 = OS-assigned)
     #[arg(long, default_value_t = 0)]
     port: u16,
+
+    /// EL TCP listen port (0 = OS-assigned)
+    #[arg(long = "el-port", default_value_t = 0)]
+    el_port: u16,
 
     /// Deterministic RNG seed
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Bootstrap peer multiaddrs to dial
+    /// CL bootstrap peer multiaddrs to dial (QUIC)
     #[arg(long = "peer")]
     peers: Vec<Multiaddr>,
+
+    /// EL peer socket addresses to dial over TCP (e.g. 127.0.0.1:9101)
+    #[arg(long = "el-peer")]
+    el_peers: Vec<SocketAddr>,
 
     /// Number of 12-second slots to simulate
     #[arg(long, default_value_t = 10)]
@@ -62,13 +73,15 @@ async fn main() {
     info!(
         roles = %roles,
         port = cli.port,
+        el_port = cli.el_port,
         seed = cli.seed,
         peers = ?cli.peers,
+        el_peers = ?cli.el_peers,
         slots = cli.slots,
         "blob-sim starting"
     );
 
-    // Build the libp2p swarm
+    // Build the CL libp2p swarm (QUIC)
     let (mut swarm, local_peer_id) = build_swarm(cli.seed, cli.port);
     info!(%local_peer_id, "swarm built");
 
@@ -80,9 +93,20 @@ async fn main() {
         dial_peers(&mut swarm, &cli.peers);
     }
 
+    // Spawn the EL networking actor (TCP) and connect to EL peers.
+    let mut el = spawn_el_network(cli.el_port, cli.el_peers);
+
     // Create bandwidth metrics tracker
     let mut metrics = BandwidthMetrics::new(&roles);
 
     // Run the state machine
-    run_node(&roles, &mut swarm, cli.seed, cli.slots, &mut metrics).await;
+    run_node(
+        &roles,
+        &mut swarm,
+        &mut el,
+        cli.seed,
+        cli.slots,
+        &mut metrics,
+    )
+    .await;
 }

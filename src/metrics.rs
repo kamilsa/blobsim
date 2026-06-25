@@ -20,6 +20,8 @@ pub struct BandwidthMetrics {
     el_responses_received: u64,
     el_requests_received: u64,
     el_responses_sent: u64,
+    el_announces_sent: u64,
+    el_announces_received: u64,
     gossip_messages_sent: u64,
     gossip_messages_received: u64,
     gossip_messages_forwarded: u64,
@@ -44,6 +46,8 @@ impl BandwidthMetrics {
             el_responses_received: 0,
             el_requests_received: 0,
             el_responses_sent: 0,
+            el_announces_sent: 0,
+            el_announces_received: 0,
             gossip_messages_sent: 0,
             gossip_messages_received: 0,
             gossip_messages_forwarded: 0,
@@ -114,6 +118,19 @@ impl BandwidthMetrics {
         self.el_responses_sent += 1;
     }
 
+    /// Record an EL blob-hash announcement sent (Builder → peer). Call once per
+    /// recipient peer so fan-out bandwidth is accounted (mirrors gossip forwarding).
+    pub fn record_el_announce_sent(&mut self, bytes: usize) {
+        self.el_bytes_sent += bytes as u64;
+        self.el_announces_sent += 1;
+    }
+
+    /// Record an EL blob-hash announcement received.
+    pub fn record_el_announce_received(&mut self, bytes: usize) {
+        self.el_bytes_received += bytes as u64;
+        self.el_announces_received += 1;
+    }
+
     // -- Reporting --
 
     /// Emit a structured per-slot summary log line and reset slot counters.
@@ -124,6 +141,7 @@ impl BandwidthMetrics {
              cl_bytes_sent={} cl_bytes_received={} \
              el_requests_sent={} el_responses_received={} \
              el_requests_received={} el_responses_sent={} \
+             el_announces_sent={} el_announces_received={} \
              gossip_sent={} gossip_received={} gossip_forwarded={}",
             slot,
             self.roles_label,
@@ -135,6 +153,8 @@ impl BandwidthMetrics {
             self.el_responses_received,
             self.el_requests_received,
             self.el_responses_sent,
+            self.el_announces_sent,
+            self.el_announces_received,
             self.gossip_messages_sent,
             self.gossip_messages_received,
             self.gossip_messages_forwarded,
@@ -155,6 +175,8 @@ impl BandwidthMetrics {
         self.el_responses_received = 0;
         self.el_requests_received = 0;
         self.el_responses_sent = 0;
+        self.el_announces_sent = 0;
+        self.el_announces_received = 0;
         self.gossip_messages_sent = 0;
         self.gossip_messages_received = 0;
         self.gossip_messages_forwarded = 0;

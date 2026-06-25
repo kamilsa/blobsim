@@ -1,4 +1,8 @@
-//! Networking layer: libp2p swarm with QUIC transport, Gossipsub, and Request-Response.
+//! Networking layer: libp2p swarm with QUIC transport and Gossipsub for the CL.
+//!
+//! This module carries **consensus-layer** traffic only (beacon blocks, payload
+//! envelopes, blob sidecars, PTC attestations). Execution-layer blob propagation
+//! runs over a separate TCP transport — see `el_net.rs`.
 //!
 //! The network module is strictly decoupled from the state machine — it builds and
 //! configures the swarm, and the state machine drives it via the event loop.
@@ -6,7 +10,6 @@
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAuthenticity},
     identity,
-    request_response::{self, ProtocolSupport},
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -25,8 +28,6 @@ pub const TOPIC_CL_PAYLOAD_ENVELOPE: &str = "/cl/payload_envelope/1";
 pub const TOPIC_CL_BLOB_SIDECAR: &str = "/cl/blob_sidecar/1";
 /// CL topic: PTC attestation messages.
 pub const TOPIC_CL_PTC_ATTESTATION: &str = "/cl/ptc_attestation/1";
-/// EL topic: blob hash announcements (simulating devp2p eth/71).
-pub const TOPIC_EL_BLOB_HASH: &str = "/el/blob_hash/1";
 
 /// All topics a node should subscribe to.
 pub fn all_topics() -> Vec<IdentTopic> {
@@ -35,16 +36,8 @@ pub fn all_topics() -> Vec<IdentTopic> {
         IdentTopic::new(TOPIC_CL_PAYLOAD_ENVELOPE),
         IdentTopic::new(TOPIC_CL_BLOB_SIDECAR),
         IdentTopic::new(TOPIC_CL_PTC_ATTESTATION),
-        IdentTopic::new(TOPIC_EL_BLOB_HASH),
     ]
 }
-
-// ---------------------------------------------------------------------------
-// Request-Response protocol name
-// ---------------------------------------------------------------------------
-
-/// Protocol name for the simulated devp2p overlay (custody-cell / full-payload).
-pub const DEVP2P_PROTOCOL: &str = "/sim/devp2p/1";
 
 // ---------------------------------------------------------------------------
 // Combined network behaviour
@@ -52,12 +45,13 @@ pub const DEVP2P_PROTOCOL: &str = "/sim/devp2p/1";
 
 /// The composed libp2p behaviour for the simulator.
 ///
-/// - `gossipsub`: CL gossip (bids, envelopes, sidecars, PTC attestations) + EL blob hash gossip.
-/// - `req_res`: EL devp2p overlay for custody-cell and full-payload request/response.
+/// - `gossipsub`: CL gossip (bids, envelopes, sidecars, PTC attestations).
+///
+/// Execution-layer blob propagation does not use libp2p; it runs over TCP in
+/// `el_net.rs`.
 #[derive(NetworkBehaviour)]
 pub struct SimBehaviour {
     pub gossipsub: gossipsub::Behaviour,
-    pub req_res: request_response::json::Behaviour<crate::types::SimRequest, crate::types::SimResponse>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,16 +103,7 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
     )
     .expect("valid gossipsub behaviour");
 
-    // -- Request-Response (JSON codec) --
-    let req_res = request_response::json::Behaviour::new(
-        [(
-            libp2p::StreamProtocol::new(DEVP2P_PROTOCOL),
-            ProtocolSupport::Full,
-        )],
-        request_response::Config::default(),
-    );
-
-    let behaviour = SimBehaviour { gossipsub, req_res };
+    let behaviour = SimBehaviour { gossipsub };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()

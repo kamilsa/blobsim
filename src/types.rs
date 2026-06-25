@@ -4,6 +4,7 @@
 //! with `Vec<u8>` dummy byte vectors to avoid CPU overhead inside Shadow and to
 //! stay within serde's default array-size support.
 
+use alloy_rlp::{Bytes, Decodable, RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -209,49 +210,117 @@ pub struct PayloadAttestationMessage {
 }
 
 // ---------------------------------------------------------------------------
-// EL devp2p messages (simulated via gossipsub + request-response)
+// EL devp2p messages (real point-to-point TCP transport, RLP-encoded)
 // ---------------------------------------------------------------------------
+//
+// These mirror the execution-layer blob propagation flow: the builder announces
+// blob hashes (eth/71 `NewPooledTransactionHashes` style), samplers pull custody
+// cells and providers pull the full payload, and the builder serves both. Unlike
+// the CL messages above (JSON over gossipsub), these are RLP-encoded and sent over
+// the dedicated EL TCP layer in `el_net.rs`. Byte fields use `Bytes` so RLP encodes
+// them as byte strings (a `Vec<u8>` would RLP-encode as a list of individual bytes).
 
 /// Blob hash announcement (simulates `NewPooledTransactionHashes` in eth/71).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct BlobHashAnnounce {
     pub slot: u64,
     /// Dummy blob hashes (32 bytes each).
-    pub blob_hashes: Vec<[u8; 32]>,
+    pub blob_hashes: Vec<Bytes>,
 }
 
 /// Sampler custody-cell request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct CustodyCellRequest {
     pub slot: u64,
-    pub blob_hash: [u8; 32],
+    pub blob_hash: Bytes,
     /// Indices of the custody columns requested.
     pub column_indices: Vec<u64>,
 }
 
+/// A single custody cell (column index + dummy cell data).
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
+pub struct CustodyCell {
+    pub column: u64,
+    pub data: Bytes,
+}
+
 /// Sampler custody-cell response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct CustodyCellResponse {
     pub slot: u64,
-    pub blob_hash: [u8; 32],
-    /// Dummy cell data keyed by column index.
-    pub cells: Vec<(u64, Vec<u8>)>,
+    pub blob_hash: Bytes,
+    /// Dummy cell data for the requested columns.
+    pub cells: Vec<CustodyCell>,
 }
 
 /// Provider full-payload request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct FullPayloadRequest {
     pub slot: u64,
-    pub blob_hash: [u8; 32],
+    pub blob_hash: Bytes,
 }
 
 /// Provider full-payload response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct FullPayloadResponse {
     pub slot: u64,
-    pub blob_hash: [u8; 32],
+    pub blob_hash: Bytes,
     /// Dummy full blob data.
-    pub payload_data: Vec<u8>,
+    pub payload_data: Bytes,
+}
+
+/// EL wire message, RLP-encoded as `[msg_id byte | rlp(body)]` (devp2p style).
+#[derive(Debug, Clone)]
+pub enum ElMessage {
+    Announce(BlobHashAnnounce),
+    CustodyRequest(CustodyCellRequest),
+    CustodyResponse(CustodyCellResponse),
+    FullPayloadRequest(FullPayloadRequest),
+    FullPayloadResponse(FullPayloadResponse),
+}
+
+impl ElMessage {
+    /// Per-variant message id, written as the first byte of the frame.
+    fn id(&self) -> u8 {
+        match self {
+            ElMessage::Announce(_) => 0,
+            ElMessage::CustodyRequest(_) => 1,
+            ElMessage::CustodyResponse(_) => 2,
+            ElMessage::FullPayloadRequest(_) => 3,
+            ElMessage::FullPayloadResponse(_) => 4,
+        }
+    }
+
+    /// Encode as a message-id byte followed by the RLP-encoded body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![self.id()];
+        let body = match self {
+            ElMessage::Announce(m) => alloy_rlp::encode(m),
+            ElMessage::CustodyRequest(m) => alloy_rlp::encode(m),
+            ElMessage::CustodyResponse(m) => alloy_rlp::encode(m),
+            ElMessage::FullPayloadRequest(m) => alloy_rlp::encode(m),
+            ElMessage::FullPayloadResponse(m) => alloy_rlp::encode(m),
+        };
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Decode a frame previously produced by [`ElMessage::encode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, alloy_rlp::Error> {
+        let (id, mut rest) = bytes
+            .split_first()
+            .ok_or(alloy_rlp::Error::Custom("empty EL message"))?;
+        let buf = &mut rest;
+        let msg = match id {
+            0 => ElMessage::Announce(BlobHashAnnounce::decode(buf)?),
+            1 => ElMessage::CustodyRequest(CustodyCellRequest::decode(buf)?),
+            2 => ElMessage::CustodyResponse(CustodyCellResponse::decode(buf)?),
+            3 => ElMessage::FullPayloadRequest(FullPayloadRequest::decode(buf)?),
+            4 => ElMessage::FullPayloadResponse(FullPayloadResponse::decode(buf)?),
+            _ => return Err(alloy_rlp::Error::Custom("unknown EL message id")),
+        };
+        Ok(msg)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,27 +328,15 @@ pub struct FullPayloadResponse {
 // ---------------------------------------------------------------------------
 
 /// Gossipsub message wrapper — serialised to JSON before publishing.
+///
+/// CL-only: blob-hash announcements and the custody/full-payload request flow now
+/// travel over the EL TCP layer (see [`ElMessage`]), not gossipsub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     BeaconBlock(SignedBeaconBlock),
     Envelope(SignedExecutionPayloadEnvelope),
     Sidecar(BlobSidecar),
     PtcAttestation(PayloadAttestationMessage),
-    BlobHash(BlobHashAnnounce),
-}
-
-/// Request-response request wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SimRequest {
-    CustodyCell(CustodyCellRequest),
-    FullPayload(FullPayloadRequest),
-}
-
-/// Request-response response wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SimResponse {
-    CustodyCell(CustodyCellResponse),
-    FullPayload(FullPayloadResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -364,16 +421,15 @@ impl BlobSidecar {
 }
 
 impl BlobHashAnnounce {
-    // TODO: unused until a role publishes BlobHashAnnounce on the EL topic.
-    #[allow(dead_code)]
+    /// Build an announcement of `BLOBS_PER_SLOT` dummy 32-byte blob hashes.
     pub fn dummy(slot: u64) -> Self {
         Self {
             slot,
             blob_hashes: (0..BLOBS_PER_SLOT as u8)
                 .map(|i| {
-                    let mut h = [0x00; 32];
+                    let mut h = vec![0x00u8; 32];
                     h[0] = i;
-                    h
+                    Bytes::from(h)
                 })
                 .collect(),
         }

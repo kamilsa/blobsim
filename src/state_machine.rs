@@ -1,8 +1,13 @@
 //! State machine: 12-second slot ticker with role-based event logic.
 //!
-//! The state machine drives the swarm event loop and triggers network broadcasts
-//! at the correct phase within each 12-second slot, based on the node's roles.
+//! The state machine drives both networking layers and triggers broadcasts at the
+//! correct phase within each 12-second slot:
+//!   - CL gossip (beacon blocks, payload envelopes, blob sidecars, PTC attestations)
+//!     over the libp2p/QUIC swarm (`network.rs`).
+//!   - EL blob propagation (announce → request → serve) over the TCP layer
+//!     (`el_net.rs`).
 
+use crate::el_net::{ElEvent, ElHandle, ElPeerId};
 use crate::metrics::BandwidthMetrics;
 use crate::network::{
     SimBehaviour, TOPIC_CL_BEACON_BLOCK, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
@@ -10,9 +15,9 @@ use crate::network::{
 };
 use crate::types::*;
 
+use alloy_rlp::Bytes;
 use futures::StreamExt;
 use libp2p::gossipsub::IdentTopic;
-use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
 use rand::rngs::StdRng;
@@ -39,12 +44,17 @@ impl SlotState {
 pub async fn run_node(
     roles: &NodeRoles,
     swarm: &mut Swarm<SimBehaviour>,
+    el: &mut ElHandle,
     seed: u64,
     num_slots: u64,
     metrics: &mut BandwidthMetrics,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
+
+    // Number of connected EL/TCP peers, kept up to date from EL events. Used to
+    // account fan-out bandwidth when the builder announces blob hashes.
+    let mut el_peer_count: usize = 0;
 
     info!(%roles, num_slots, "starting slot ticker");
 
@@ -70,8 +80,40 @@ pub async fn run_node(
             info!(slot, "proposer: published beacon block (containing bid)");
         }
 
+        // ---------------------------------------------------------------
+        // t=0s — EL blob-hash announcement (builder only)
+        //
+        // The builder announces its blob hashes to its EL/TCP peers (eth/71
+        // `NewPooledTransactionHashes` style). Samplers and providers react by
+        // pulling the cells / full payload they need (see `handle_el_message`).
+        // ---------------------------------------------------------------
+        if roles.is_builder() {
+            let announce = BlobHashAnnounce::dummy(slot);
+            let frame_bytes = ElMessage::Announce(announce.clone()).encode().len() + 4;
+            el.announce(announce);
+            // Account the fan-out: one frame per connected peer.
+            for _ in 0..el_peer_count {
+                metrics.record_el_announce_sent(frame_bytes);
+            }
+            info!(
+                slot,
+                peers = el_peer_count,
+                "builder: announced blob hashes over EL/TCP"
+            );
+        }
+
         // Drain events until t=4s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(4), slot, metrics, &mut slot_state).await;
+        drain_events_until(
+            swarm,
+            el,
+            roles,
+            &mut rng,
+            slot_start + Duration::from_secs(4),
+            metrics,
+            &mut slot_state,
+            &mut el_peer_count,
+        )
+        .await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase (builder only)
@@ -80,8 +122,6 @@ pub async fn run_node(
         // its bid) and knows it was selected. It publishes:
         //   1. Signed execution payload envelope on CL gossip
         //   2. Blob sidecars on CL gossip
-        // Blob hash info is already embedded in the envelope's KZG
-        // commitments, so no separate EL announcement is needed.
         // ---------------------------------------------------------------
         if roles.is_builder() {
             // Publish signed execution payload envelope
@@ -104,14 +144,38 @@ pub async fn run_node(
                     metrics,
                 );
             }
-            info!(slot, blobs = BLOBS_PER_SLOT, "builder: published blob sidecars");
+            info!(
+                slot,
+                blobs = BLOBS_PER_SLOT,
+                "builder: published blob sidecars"
+            );
         }
 
         // Drain events until t=6s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(6), slot, metrics, &mut slot_state).await;
+        drain_events_until(
+            swarm,
+            el,
+            roles,
+            &mut rng,
+            slot_start + Duration::from_secs(6),
+            metrics,
+            &mut slot_state,
+            &mut el_peer_count,
+        )
+        .await;
 
         // Drain events until t=8s
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(8), slot, metrics, &mut slot_state).await;
+        drain_events_until(
+            swarm,
+            el,
+            roles,
+            &mut rng,
+            slot_start + Duration::from_secs(8),
+            metrics,
+            &mut slot_state,
+            &mut el_peer_count,
+        )
+        .await;
 
         // ---------------------------------------------------------------
         // t=8s — PTC vote phase
@@ -142,7 +206,17 @@ pub async fn run_node(
         }
 
         // Drain events until t=12s (slot boundary)
-        drain_events_until(swarm, roles, &mut rng, slot_start + Duration::from_secs(12), slot, metrics, &mut slot_state).await;
+        drain_events_until(
+            swarm,
+            el,
+            roles,
+            &mut rng,
+            slot_start + Duration::from_secs(12),
+            metrics,
+            &mut slot_state,
+            &mut el_peer_count,
+        )
+        .await;
 
         // Emit per-slot bandwidth summary
         metrics.emit_slot_summary(slot);
@@ -160,18 +234,20 @@ pub async fn run_node(
 // Event drain loop
 // ---------------------------------------------------------------------------
 
-/// Process swarm events until the given deadline.
+/// Process events from both networking layers until the given deadline.
 ///
-/// Uses `tokio::select!` to multiplex between incoming swarm events and
-/// the deadline timer.
+/// Uses `tokio::select!` to multiplex between the deadline timer, incoming CL
+/// swarm events, and incoming EL/TCP events.
+#[allow(clippy::too_many_arguments)]
 async fn drain_events_until(
     swarm: &mut Swarm<SimBehaviour>,
+    el: &mut ElHandle,
     roles: &NodeRoles,
     rng: &mut StdRng,
     deadline: Instant,
-    current_slot: u64,
     metrics: &mut BandwidthMetrics,
     slot_state: &mut SlotState,
+    el_peer_count: &mut usize,
 ) {
     loop {
         tokio::select! {
@@ -179,19 +255,25 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, roles, rng, event, current_slot, metrics, slot_state);
+                handle_swarm_event(swarm, event, metrics, slot_state);
+            }
+            ev = el.event_rx.recv() => {
+                if let Some(ev) = ev {
+                    handle_el_event(el, roles, rng, ev, metrics, el_peer_count);
+                }
             }
         }
     }
 }
 
-/// Handle a single swarm event, dispatching based on the node's persona.
+// ---------------------------------------------------------------------------
+// CL swarm event handling
+// ---------------------------------------------------------------------------
+
+/// Handle a single CL swarm event.
 fn handle_swarm_event(
-    swarm: &mut Swarm<SimBehaviour>,
-    roles: &NodeRoles,
-    rng: &mut StdRng,
+    swarm: &Swarm<SimBehaviour>,
     event: SwarmEvent<SimBehaviourEvent>,
-    current_slot: u64,
     metrics: &mut BandwidthMetrics,
     slot_state: &mut SlotState,
 ) {
@@ -226,51 +308,10 @@ fn handle_swarm_event(
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(swarm, roles, rng, msg, current_slot, metrics, slot_state);
+                handle_gossip_message(msg, slot_state);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
             }
-        }
-
-        // -- Request-Response: incoming request --
-        SwarmEvent::Behaviour(SimBehaviourEvent::ReqRes(
-            request_response::Event::Message {
-                peer,
-                message:
-                    request_response::Message::Request {
-                        request_id,
-                        request,
-                        channel,
-                    },
-                ..
-            },
-        )) => {
-            // Record incoming request bytes
-            let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
-            metrics.record_request_received(req_bytes);
-
-            debug!(%peer, %request_id, req_bytes, "req-res request received");
-            handle_incoming_request(swarm, roles, request, channel, metrics);
-        }
-
-        // -- Request-Response: incoming response --
-        SwarmEvent::Behaviour(SimBehaviourEvent::ReqRes(
-            request_response::Event::Message {
-                peer,
-                message:
-                    request_response::Message::Response {
-                        request_id,
-                        response,
-                    },
-                ..
-            },
-        )) => {
-            // Record incoming response bytes
-            let resp_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
-            metrics.record_response_received(resp_bytes);
-
-            debug!(%peer, %request_id, resp_bytes, "req-res response received");
-            handle_incoming_response(response);
         }
 
         // -- Connection established --
@@ -292,19 +333,8 @@ fn handle_swarm_event(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Gossip message handling
-// ---------------------------------------------------------------------------
-
-fn handle_gossip_message(
-    swarm: &mut Swarm<SimBehaviour>,
-    roles: &NodeRoles,
-    rng: &mut StdRng,
-    msg: GossipMessage,
-    current_slot: u64,
-    metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
-) {
+/// Handle a decoded CL gossip message (logging + per-slot state tracking).
+fn handle_gossip_message(msg: GossipMessage, slot_state: &mut SlotState) {
     match msg {
         GossipMessage::BeaconBlock(block) => {
             info!(
@@ -342,181 +372,171 @@ fn handle_gossip_message(
                 "received PTC attestation"
             );
         }
-
-        GossipMessage::BlobHash(announce) => {
-            info!(
-                slot = announce.slot,
-                hashes = announce.blob_hashes.len(),
-                "received blob hash announce"
-            );
-
-            // TODO: BlobHashAnnounce is not currently published by any role.
-            // In a future iteration, samplers should react by fetching only
-            // their custody column cells, and providers should fetch the
-            // entire blob payload.
-            if roles.is_sampler() {
-                send_custody_requests(swarm, rng, &announce, current_slot, metrics);
-            }
-            if roles.is_provider() {
-                send_full_payload_requests(swarm, &announce, current_slot, metrics);
-            }
-        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// EL request/response handling
+// EL/TCP event handling
 // ---------------------------------------------------------------------------
 
-/// Sampler: send custody cell requests for a subset of columns + 1 random extra.
-fn send_custody_requests(
-    swarm: &mut Swarm<SimBehaviour>,
+/// Handle a single EL/TCP event.
+fn handle_el_event(
+    el: &ElHandle,
+    roles: &NodeRoles,
     rng: &mut StdRng,
-    announce: &BlobHashAnnounce,
-    _current_slot: u64,
+    event: ElEvent,
+    metrics: &mut BandwidthMetrics,
+    el_peer_count: &mut usize,
+) {
+    match event {
+        ElEvent::PeerConnected(peer) => {
+            *el_peer_count += 1;
+            info!(peer, peers = *el_peer_count, "EL: peer connected");
+        }
+        ElEvent::PeerDisconnected(peer) => {
+            *el_peer_count = el_peer_count.saturating_sub(1);
+            info!(peer, peers = *el_peer_count, "EL: peer disconnected");
+        }
+        ElEvent::Message { from, msg, bytes } => {
+            handle_el_message(el, roles, rng, from, msg, bytes, metrics);
+        }
+    }
+}
+
+/// Dispatch an inbound EL message based on type and this node's roles.
+fn handle_el_message(
+    el: &ElHandle,
+    roles: &NodeRoles,
+    rng: &mut StdRng,
+    from: ElPeerId,
+    msg: ElMessage,
+    bytes: usize,
     metrics: &mut BandwidthMetrics,
 ) {
-    // Deterministically choose custody columns
+    match msg {
+        // -- Blob hash announcement: samplers/providers pull what they need --
+        ElMessage::Announce(announce) => {
+            metrics.record_el_announce_received(bytes);
+            info!(
+                slot = announce.slot,
+                hashes = announce.blob_hashes.len(),
+                from,
+                "EL: received blob hash announce"
+            );
+            if roles.is_sampler() {
+                send_custody_requests(el, rng, from, &announce, metrics);
+            }
+            if roles.is_provider() {
+                send_full_payload_requests(el, from, &announce, metrics);
+            }
+        }
+
+        // -- Incoming requests: the holder (builder) serves a response --
+        ElMessage::CustodyRequest(req) => {
+            metrics.record_request_received(bytes);
+            info!(slot = req.slot, columns = ?req.column_indices, from, "EL: handling custody cell request");
+            let cells: Vec<CustodyCell> = req
+                .column_indices
+                .iter()
+                .map(|&column| CustodyCell {
+                    column,
+                    data: Bytes::from(vec![0xAA; 64]), // dummy cell data
+                })
+                .collect();
+            let response = ElMessage::CustodyResponse(CustodyCellResponse {
+                slot: req.slot,
+                blob_hash: req.blob_hash,
+                cells,
+            });
+            let resp_bytes = response.encode().len() + 4;
+            metrics.record_response_sent(resp_bytes);
+            el.send(from, response);
+        }
+
+        ElMessage::FullPayloadRequest(req) => {
+            metrics.record_request_received(bytes);
+            info!(slot = req.slot, from, "EL: handling full payload request");
+            let response = ElMessage::FullPayloadResponse(FullPayloadResponse {
+                slot: req.slot,
+                blob_hash: req.blob_hash,
+                payload_data: Bytes::from(vec![0xBB; DUMMY_BLOB_SIZE]),
+            });
+            let resp_bytes = response.encode().len() + 4;
+            metrics.record_response_sent(resp_bytes);
+            el.send(from, response);
+        }
+
+        // -- Incoming responses (sampler/provider side) --
+        ElMessage::CustodyResponse(resp) => {
+            metrics.record_response_received(bytes);
+            info!(
+                slot = resp.slot,
+                cells = resp.cells.len(),
+                from,
+                "EL: received custody cells"
+            );
+        }
+        ElMessage::FullPayloadResponse(resp) => {
+            metrics.record_response_received(bytes);
+            info!(
+                slot = resp.slot,
+                payload_size = resp.payload_data.len(),
+                from,
+                "EL: received full payload"
+            );
+        }
+    }
+}
+
+/// Sampler: request a deterministic subset of custody columns (+1 random extra)
+/// from the announcing peer, for each announced blob hash.
+fn send_custody_requests(
+    el: &ElHandle,
+    rng: &mut StdRng,
+    peer: ElPeerId,
+    announce: &BlobHashAnnounce,
+    metrics: &mut BandwidthMetrics,
+) {
+    // Deterministically choose custody columns + 1 random extra.
     let mut columns: HashSet<u64> = HashSet::new();
     while columns.len() < CUSTODY_SUBSET_SIZE {
         columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
     }
-    // Add 1 random extra column
-    let extra: u64 = rng.gen_range(0..NUM_CUSTODY_COLUMNS);
-    columns.insert(extra);
-
+    columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
     let column_indices: Vec<u64> = columns.into_iter().collect();
 
     for blob_hash in &announce.blob_hashes {
-        let request = SimRequest::CustodyCell(CustodyCellRequest {
+        let request = ElMessage::CustodyRequest(CustodyCellRequest {
             slot: announce.slot,
-            blob_hash: *blob_hash,
+            blob_hash: blob_hash.clone(),
             column_indices: column_indices.clone(),
         });
-
-        // Measure request size
-        let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
-
-        // Send to all connected peers (in practice, to the builder or other holders)
-        let peers: Vec<_> = swarm.connected_peers().cloned().collect();
-        for peer_id in peers {
-            info!(
-                slot = announce.slot,
-                columns = ?column_indices,
-                %peer_id,
-                req_bytes,
-                "sampler: sending custody cell request"
-            );
-            metrics.record_request_sent(req_bytes);
-            swarm
-                .behaviour_mut()
-                .req_res
-                .send_request(&peer_id, request.clone());
-        }
+        let req_bytes = request.encode().len() + 4;
+        info!(slot = announce.slot, columns = ?column_indices, peer, req_bytes, "sampler: sending custody cell request");
+        metrics.record_request_sent(req_bytes);
+        el.send(peer, request);
     }
 }
 
-/// Provider: send full payload requests.
+/// Provider: request the full payload from the announcing peer, per blob hash.
 fn send_full_payload_requests(
-    swarm: &mut Swarm<SimBehaviour>,
+    el: &ElHandle,
+    peer: ElPeerId,
     announce: &BlobHashAnnounce,
-    _current_slot: u64,
     metrics: &mut BandwidthMetrics,
 ) {
     for blob_hash in &announce.blob_hashes {
-        let request = SimRequest::FullPayload(FullPayloadRequest {
+        let request = ElMessage::FullPayloadRequest(FullPayloadRequest {
             slot: announce.slot,
-            blob_hash: *blob_hash,
+            blob_hash: blob_hash.clone(),
         });
-
-        // Measure request size
-        let req_bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
-
-        let peers: Vec<_> = swarm.connected_peers().cloned().collect();
-        for peer_id in peers {
-            info!(
-                slot = announce.slot,
-                %peer_id,
-                req_bytes,
-                "provider: sending full payload request"
-            );
-            metrics.record_request_sent(req_bytes);
-            swarm
-                .behaviour_mut()
-                .req_res
-                .send_request(&peer_id, request.clone());
-        }
-    }
-}
-
-/// Handle an incoming request (typically on the builder side).
-fn handle_incoming_request(
-    swarm: &mut Swarm<SimBehaviour>,
-    _roles: &NodeRoles,
-    request: SimRequest,
-    channel: request_response::ResponseChannel<SimResponse>,
-    metrics: &mut BandwidthMetrics,
-) {
-    let response = match request {
-        SimRequest::CustodyCell(req) => {
-            info!(
-                slot = req.slot,
-                columns = ?req.column_indices,
-                "handling custody cell request"
-            );
-            let cells: Vec<(u64, Vec<u8>)> = req
-                .column_indices
-                .iter()
-                .map(|&col| (col, vec![0xAA; 64])) // dummy cell data
-                .collect();
-            SimResponse::CustodyCell(CustodyCellResponse {
-                slot: req.slot,
-                blob_hash: req.blob_hash,
-                cells,
-            })
-        }
-        SimRequest::FullPayload(req) => {
-            info!(slot = req.slot, "handling full payload request");
-            SimResponse::FullPayload(FullPayloadResponse {
-                slot: req.slot,
-                blob_hash: req.blob_hash,
-                payload_data: vec![0xBB; DUMMY_BLOB_SIZE],
-            })
-        }
-    };
-
-    // Record outgoing response bytes
-    let resp_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
-    metrics.record_response_sent(resp_bytes);
-    debug!(resp_bytes, "req-res response sent");
-
-    if swarm
-        .behaviour_mut()
-        .req_res
-        .send_response(channel, response)
-        .is_err()
-    {
-        warn!("failed to send response (channel closed)");
-    }
-}
-
-/// Handle an incoming response (Sampler or Provider side).
-fn handle_incoming_response(response: SimResponse) {
-    match response {
-        SimResponse::CustodyCell(resp) => {
-            info!(
-                slot = resp.slot,
-                cells = resp.cells.len(),
-                "sampler: received custody cells"
-            );
-        }
-        SimResponse::FullPayload(resp) => {
-            info!(
-                slot = resp.slot,
-                payload_size = resp.payload_data.len(),
-                "provider: received full payload"
-            );
-        }
+        let req_bytes = request.encode().len() + 4;
+        info!(
+            slot = announce.slot,
+            peer, req_bytes, "provider: sending full payload request"
+        );
+        metrics.record_request_sent(req_bytes);
+        el.send(peer, request);
     }
 }
 
