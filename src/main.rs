@@ -12,8 +12,8 @@ mod types;
 use crate::el_net::spawn_el_network;
 use crate::metrics::BandwidthMetrics;
 use crate::network::{build_swarm, dial_peers, subscribe_all};
-use crate::state_machine::run_node;
-use crate::types::{NodeRoles, Role};
+use crate::state_machine::{run_blob_spammer, run_node};
+use crate::types::{NodeRoles, Role, BLOBS_PER_SLOT};
 
 use clap::Parser;
 use libp2p::Multiaddr;
@@ -56,6 +56,16 @@ struct Cli {
     /// Number of 12-second slots to simulate
     #[arg(long, default_value_t = 10)]
     slots: u64,
+
+    /// Blobs produced per slot by a blob-spammer node (the spam rate knob),
+    /// paced evenly across the slot.
+    #[arg(long = "blobs-per-slot", default_value_t = BLOBS_PER_SLOT)]
+    blobs_per_slot: usize,
+
+    /// Per-node id mixed into the RNG seed so that blob-spammers launched with the
+    /// same --seed still produce distinct blobs. The launcher assigns a unique value.
+    #[arg(long = "node-id", default_value_t = 0)]
+    node_id: u64,
 }
 
 #[tokio::main]
@@ -80,6 +90,25 @@ async fn main() {
         slots = cli.slots,
         "blob-sim starting"
     );
+
+    // A blob-spammer is EL-only: it never builds or joins the CL swarm. Run its
+    // dedicated loop over just the EL/TCP layer and exit.
+    if roles.is_blob_spammer() {
+        let mut el = spawn_el_network(cli.el_port, cli.el_peers);
+        let mut metrics = BandwidthMetrics::new(&roles);
+        run_blob_spammer(
+            &roles,
+            &mut el,
+            cli.seed,
+            cli.node_id,
+            cli.slots,
+            cli.blobs_per_slot,
+            &mut metrics,
+        )
+        .await;
+        info!("blob-spammer finished, shutting down");
+        return;
+    }
 
     // Build the CL libp2p swarm (QUIC)
     let (mut swarm, local_peer_id) = build_swarm(cli.seed, cli.port);

@@ -5,6 +5,7 @@
 //! stay within serde's default array-size support.
 
 use alloy_rlp::{Bytes, Decodable, RlpDecodable, RlpEncodable};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -25,6 +26,9 @@ pub enum Role {
     Provider,
     /// PTC member: votes on payload timeliness at t=8s.
     PtcMember,
+    /// EL-only blob load generator: originates and serves blobs at a configurable
+    /// per-slot rate, paced across the slot. Holds no CL roles.
+    BlobSpammer,
 }
 
 impl fmt::Display for Role {
@@ -35,6 +39,7 @@ impl fmt::Display for Role {
             Self::Sampler => write!(f, "sampler"),
             Self::Provider => write!(f, "provider"),
             Self::PtcMember => write!(f, "ptc"),
+            Self::BlobSpammer => write!(f, "blob-spammer"),
         }
     }
 }
@@ -48,6 +53,7 @@ impl std::str::FromStr for Role {
             "sampler" => Ok(Self::Sampler),
             "provider" => Ok(Self::Provider),
             "ptc" | "ptc_member" | "ptcmember" => Ok(Self::PtcMember),
+            "blob-spammer" | "blob_spammer" | "spammer" => Ok(Self::BlobSpammer),
             other => Err(format!("unknown role: {other}")),
         }
     }
@@ -62,6 +68,7 @@ pub struct NodeRoles {
     pub sampler: bool,
     pub provider: bool,
     pub ptc_member: bool,
+    pub blob_spammer: bool,
 }
 
 impl NodeRoles {
@@ -74,6 +81,7 @@ impl NodeRoles {
             sampler: false,
             provider: false,
             ptc_member: false,
+            blob_spammer: false,
         };
         for r in roles {
             match r {
@@ -82,11 +90,17 @@ impl NodeRoles {
                 Role::Sampler => nr.sampler = true,
                 Role::Provider => nr.provider = true,
                 Role::PtcMember => nr.ptc_member = true,
+                Role::BlobSpammer => nr.blob_spammer = true,
             }
         }
         assert!(
             !(nr.sampler && nr.provider),
             "a node cannot be both sampler and provider"
+        );
+        let has_cl = nr.proposer || nr.builder || nr.sampler || nr.provider || nr.ptc_member;
+        assert!(
+            !(nr.blob_spammer && has_cl),
+            "blob-spammer is EL-only and cannot be combined with CL roles"
         );
         nr
     }
@@ -105,6 +119,9 @@ impl NodeRoles {
     }
     pub fn is_ptc_member(&self) -> bool {
         self.ptc_member
+    }
+    pub fn is_blob_spammer(&self) -> bool {
+        self.blob_spammer
     }
 }
 
@@ -125,6 +142,9 @@ impl fmt::Display for NodeRoles {
         }
         if self.ptc_member {
             parts.push("ptc");
+        }
+        if self.blob_spammer {
+            parts.push("blob-spammer");
         }
         write!(f, "{}", parts.join("+"))
     }
@@ -188,7 +208,7 @@ pub struct BlobSidecar {
     pub kzg_commitment: Vec<u8>,
     /// Dummy KZG proof (48 bytes).
     pub kzg_proof: Vec<u8>,
-    /// Small dummy blob data (not full 128 KiB — just enough to exercise networking).
+    /// Full blob data (128 KiB = 64 cells × 2 KiB).
     pub blob_data: Vec<u8>,
 }
 
@@ -349,8 +369,16 @@ pub const NUM_CUSTODY_COLUMNS: u64 = 128;
 /// Number of custody columns a sampler node is assigned.
 pub const CUSTODY_SUBSET_SIZE: usize = 4;
 
-/// Size of dummy blob data in bytes (small to save bandwidth in simulation).
-pub const DUMMY_BLOB_SIZE: usize = 512;
+/// Size of a single cell (column) in bytes. PeerDAS cell = 64 field elements ×
+/// 32 B = 2 KiB.
+pub const BYTES_PER_CELL: usize = 2 * 1024;
+
+/// Number of cells in an (un-extended) blob: 64 cells × 2 KiB = 128 KiB.
+pub const CELLS_PER_BLOB: usize = 64;
+
+/// Full blob size in bytes (128 KiB). Reed-Solomon extension doubles this to
+/// `NUM_CUSTODY_COLUMNS` (128) cells = 256 KiB across the extended column set.
+pub const BLOB_SIZE: usize = BYTES_PER_CELL * CELLS_PER_BLOB;
 
 /// Number of blobs per slot (simplified).
 pub const BLOBS_PER_SLOT: usize = 6;
@@ -404,8 +432,18 @@ impl SignedExecutionPayloadEnvelope {
     }
 }
 
+/// Fill `n` bytes with random data drawn from `rng`. Used to give each blob
+/// distinct, random payload content (seeded for reproducibility per node).
+pub fn random_bytes(rng: &mut impl RngCore, n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    rng.fill_bytes(&mut v);
+    v
+}
+
 impl BlobSidecar {
-    pub fn dummy(slot: u64, index: u64) -> Self {
+    /// Build a sidecar carrying a full 128 KiB blob of random data. The KZG
+    /// commitment/proof fields remain dummy placeholders.
+    pub fn random(slot: u64, index: u64, rng: &mut impl RngCore) -> Self {
         Self {
             blob_index: index,
             slot,
@@ -415,23 +453,53 @@ impl BlobSidecar {
                 c
             },
             kzg_proof: vec![0xEE; 48],
-            blob_data: vec![0xFF; DUMMY_BLOB_SIZE],
+            blob_data: random_bytes(rng, BLOB_SIZE),
         }
     }
 }
 
 impl BlobHashAnnounce {
-    /// Build an announcement of `BLOBS_PER_SLOT` dummy 32-byte blob hashes.
-    pub fn dummy(slot: u64) -> Self {
+    /// Build an announcement of `count` random 32-byte blob hashes. Random hashes
+    /// keep every announced blob globally distinct.
+    pub fn random(slot: u64, count: usize, rng: &mut impl RngCore) -> Self {
         Self {
             slot,
-            blob_hashes: (0..BLOBS_PER_SLOT as u8)
-                .map(|i| {
-                    let mut h = vec![0x00u8; 32];
-                    h[0] = i;
-                    Bytes::from(h)
-                })
+            blob_hashes: (0..count)
+                .map(|_| Bytes::from(random_bytes(rng, 32)))
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn blob_data_is_seeded_reproducible_and_distinct() {
+        // Same RNG seed → identical blob bytes (reproducible per producer).
+        let a = BlobSidecar::random(0, 0, &mut StdRng::seed_from_u64(123));
+        let b = BlobSidecar::random(0, 0, &mut StdRng::seed_from_u64(123));
+        assert_eq!(a.blob_data, b.blob_data);
+        assert_eq!(a.blob_data.len(), BLOB_SIZE);
+
+        // Different seed → different blob bytes (distinct across producers; this is
+        // what a per-node `node_id` mixed into the seed achieves for spammers).
+        let c = BlobSidecar::random(0, 0, &mut StdRng::seed_from_u64(456));
+        assert_ne!(a.blob_data, c.blob_data);
+
+        // Consecutive blobs drawn from the same RNG differ from one another.
+        let mut rng = StdRng::seed_from_u64(123);
+        let x = BlobSidecar::random(0, 0, &mut rng);
+        let y = BlobSidecar::random(0, 1, &mut rng);
+        assert_ne!(x.blob_data, y.blob_data);
+    }
+
+    #[test]
+    #[should_panic(expected = "EL-only")]
+    fn blob_spammer_cannot_combine_with_cl_roles() {
+        let _ = NodeRoles::from_roles(&[Role::BlobSpammer, Role::Builder]);
     }
 }
