@@ -80,11 +80,6 @@ pub async fn run_node(
             info!(slot, "proposer: published beacon block (containing bid)");
         }
 
-        // Note: the builder no longer originates blobs on EL. Blob hash
-        // announcements over EL/TCP are produced by the `blob-spammer` role
-        // (see `run_blob_spammer`). The builder still participates in EL (serving
-        // requests via `handle_el_message`) and gossips CL blob sidecars below.
-
         // Drain events until t=4s
         drain_events_until(
             swarm,
