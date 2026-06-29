@@ -80,27 +80,10 @@ pub async fn run_node(
             info!(slot, "proposer: published beacon block (containing bid)");
         }
 
-        // ---------------------------------------------------------------
-        // t=0s — EL blob-hash announcement (builder only)
-        //
-        // The builder announces its blob hashes to its EL/TCP peers (eth/71
-        // `NewPooledTransactionHashes` style). Samplers and providers react by
-        // pulling the cells / full payload they need (see `handle_el_message`).
-        // ---------------------------------------------------------------
-        if roles.is_builder() {
-            let announce = BlobHashAnnounce::dummy(slot);
-            let frame_bytes = ElMessage::Announce(announce.clone()).encode().len() + 4;
-            el.announce(announce);
-            // Account the fan-out: one frame per connected peer.
-            for _ in 0..el_peer_count {
-                metrics.record_el_announce_sent(frame_bytes);
-            }
-            info!(
-                slot,
-                peers = el_peer_count,
-                "builder: announced blob hashes over EL/TCP"
-            );
-        }
+        // Note: the builder no longer originates blobs on EL. Blob hash
+        // announcements over EL/TCP are produced by the `blob-spammer` role
+        // (see `run_blob_spammer`). The builder still participates in EL (serving
+        // requests via `handle_el_message`) and gossips CL blob sidecars below.
 
         // Drain events until t=4s
         drain_events_until(
@@ -136,7 +119,7 @@ pub async fn run_node(
 
             // Publish blob sidecars
             for i in 0..BLOBS_PER_SLOT as u64 {
-                let sidecar = BlobSidecar::dummy(slot, i);
+                let sidecar = BlobSidecar::random(slot, i, &mut rng);
                 publish_gossip(
                     swarm,
                     TOPIC_CL_BLOB_SIDECAR,
@@ -228,6 +211,87 @@ pub async fn run_node(
     metrics.emit_final_summary(num_slots);
 
     info!("all slots completed, shutting down");
+}
+
+// ---------------------------------------------------------------------------
+// Blob-spammer (EL-only load generator)
+// ---------------------------------------------------------------------------
+
+/// Mix the base `--seed` with the node-unique `--node-id` so that blob-spammers
+/// launched with the same seed still produce distinct blobs, while a given
+/// `(seed, node_id)` pair stays reproducible across runs.
+fn mix_seed(seed: u64, node_id: u64) -> u64 {
+    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(node_id)
+}
+
+/// Run an EL-only blob-spammer node.
+///
+/// Each 12s slot the spammer originates `blobs_per_slot` random blobs, announcing
+/// their hashes over EL/TCP **paced evenly across the slot** (not all at once), and
+/// serves any custody-cell / full-payload requests peers make in response. It never
+/// touches the CL gossip layer.
+pub async fn run_blob_spammer(
+    roles: &NodeRoles,
+    el: &mut ElHandle,
+    seed: u64,
+    node_id: u64,
+    num_slots: u64,
+    blobs_per_slot: usize,
+    metrics: &mut BandwidthMetrics,
+) {
+    let mut rng = StdRng::seed_from_u64(mix_seed(seed, node_id));
+    let mut el_peer_count: usize = 0;
+
+    info!(%roles, num_slots, blobs_per_slot, node_id, "starting blob-spammer");
+
+    for slot in 0..num_slots {
+        info!(slot, %roles, "=== SLOT START ===");
+        let slot_start = Instant::now();
+        let slot_end = slot_start + Duration::from_secs(12);
+
+        // Pace `blobs_per_slot` announcements evenly across the slot. The immediate
+        // first tick means ticks land at 0, p, 2p, …, (N-1)p — all strictly before
+        // the slot boundary — so exactly `blobs_per_slot` blobs are produced.
+        let mut produced: usize = 0;
+        let period = if blobs_per_slot > 0 {
+            (Duration::from_secs(12) / blobs_per_slot as u32).max(Duration::from_nanos(1))
+        } else {
+            Duration::from_secs(12)
+        };
+        let mut ticker = tokio::time::interval(period);
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(slot_end) => {
+                    break;
+                }
+                _ = ticker.tick(), if produced < blobs_per_slot => {
+                    // Originate one random blob and announce its hash to EL peers.
+                    let announce = BlobHashAnnounce::random(slot, 1, &mut rng);
+                    let frame_bytes = ElMessage::Announce(announce.clone()).encode().len() + 4;
+                    el.announce(announce);
+                    // Account the fan-out: one frame per connected peer.
+                    for _ in 0..el_peer_count {
+                        metrics.record_el_announce_sent(frame_bytes);
+                    }
+                    produced += 1;
+                    debug!(slot, produced, peers = el_peer_count, "spammer: announced blob");
+                }
+                ev = el.event_rx.recv() => {
+                    if let Some(ev) = ev {
+                        handle_el_event(el, roles, &mut rng, ev, metrics, &mut el_peer_count);
+                    }
+                }
+            }
+        }
+
+        info!(slot, produced, peers = el_peer_count, "spammer: slot complete");
+        metrics.emit_slot_summary(slot);
+        info!(slot, "=== SLOT END ===");
+    }
+
+    metrics.emit_final_summary(num_slots);
+    info!("blob-spammer: all slots completed");
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +504,7 @@ fn handle_el_message(
                 .iter()
                 .map(|&column| CustodyCell {
                     column,
-                    data: Bytes::from(vec![0xAA; BYTES_PER_CELL]), // 2 KiB per cell
+                    data: Bytes::from(random_bytes(rng, BYTES_PER_CELL)), // 2 KiB per cell
                 })
                 .collect();
             let response = ElMessage::CustodyResponse(CustodyCellResponse {
@@ -459,7 +523,7 @@ fn handle_el_message(
             let response = ElMessage::FullPayloadResponse(FullPayloadResponse {
                 slot: req.slot,
                 blob_hash: req.blob_hash,
-                payload_data: Bytes::from(vec![0xBB; BLOB_SIZE]),
+                payload_data: Bytes::from(random_bytes(rng, BLOB_SIZE)),
             });
             let resp_bytes = response.encode().len() + 4;
             metrics.record_response_sent(resp_bytes);
