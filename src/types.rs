@@ -188,7 +188,7 @@ pub struct BlobSidecar {
     pub kzg_commitment: Vec<u8>,
     /// Dummy KZG proof (48 bytes).
     pub kzg_proof: Vec<u8>,
-    /// Small dummy blob data (not full 128 KiB — just enough to exercise networking).
+    /// Full blob data (128 KiB = 64 cells × 2 KiB).
     pub blob_data: Vec<u8>,
 }
 
@@ -349,8 +349,16 @@ pub const NUM_CUSTODY_COLUMNS: u64 = 128;
 /// Number of custody columns a sampler node is assigned.
 pub const CUSTODY_SUBSET_SIZE: usize = 4;
 
-/// Size of dummy blob data in bytes (small to save bandwidth in simulation).
-pub const DUMMY_BLOB_SIZE: usize = 512;
+/// Size of a single cell (column) in bytes. PeerDAS cell = 64 field elements ×
+/// 32 B = 2 KiB.
+pub const BYTES_PER_CELL: usize = 2 * 1024;
+
+/// Number of cells in an (un-extended) blob: 64 cells × 2 KiB = 128 KiB.
+pub const CELLS_PER_BLOB: usize = 64;
+
+/// Full blob size in bytes (128 KiB). Reed-Solomon extension doubles this to
+/// `NUM_CUSTODY_COLUMNS` (128) cells = 256 KiB across the extended column set.
+pub const BLOB_SIZE: usize = BYTES_PER_CELL * CELLS_PER_BLOB;
 
 /// Number of blobs per slot (simplified).
 pub const BLOBS_PER_SLOT: usize = 6;
@@ -415,7 +423,7 @@ impl BlobSidecar {
                 c
             },
             kzg_proof: vec![0xEE; 48],
-            blob_data: vec![0xFF; DUMMY_BLOB_SIZE],
+            blob_data: vec![0xFF; BLOB_SIZE],
         }
     }
 }

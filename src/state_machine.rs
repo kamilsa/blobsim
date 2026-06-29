@@ -440,7 +440,7 @@ fn handle_el_message(
                 .iter()
                 .map(|&column| CustodyCell {
                     column,
-                    data: Bytes::from(vec![0xAA; 64]), // dummy cell data
+                    data: Bytes::from(vec![0xAA; BYTES_PER_CELL]), // 2 KiB per cell
                 })
                 .collect();
             let response = ElMessage::CustodyResponse(CustodyCellResponse {
@@ -459,7 +459,7 @@ fn handle_el_message(
             let response = ElMessage::FullPayloadResponse(FullPayloadResponse {
                 slot: req.slot,
                 blob_hash: req.blob_hash,
-                payload_data: Bytes::from(vec![0xBB; DUMMY_BLOB_SIZE]),
+                payload_data: Bytes::from(vec![0xBB; BLOB_SIZE]),
             });
             let resp_bytes = response.encode().len() + 4;
             metrics.record_response_sent(resp_bytes);
