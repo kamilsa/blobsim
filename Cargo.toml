@@ -8,9 +8,14 @@ description = "Shadow-compatible Ethereum blob propagation simulator (EIP-7732 /
 name = "blob-sim"
 path = "src/main.rs"
 
+# libp2p is pinned to a rust-libp2p master rev because gossipsub 1.3 partial
+# messages (PR #6275, gossipsub 0.50.0 / umbrella 0.57.0) are not yet published
+# to crates.io. The `gossipsub-partial-messages` feature is the passthrough to
+# `libp2p-gossipsub/partial-messages`.
 [dependencies]
-libp2p = { version = "0.54", features = [
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "891bf049c63f65a1b9500b00c6d0a39afae175a2", features = [
     "gossipsub",
+    "gossipsub-partial-messages",
     "quic",
     "dns",
     "tokio",
@@ -22,6 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Compact binary codec for partial data-column messages (cells are raw 2 KiB
+# bytes; JSON would base64-bloat them and distort bandwidth accounting).
+bincode = "1"
 rand = "0.8"
 futures = "0.3"
 alloy-rlp = { version = "0.3", features = ["derive"] }

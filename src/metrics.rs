@@ -26,6 +26,18 @@ pub struct BandwidthMetrics {
     gossip_messages_received: u64,
     gossip_messages_forwarded: u64,
 
+    // -- Partial data-column counters (gossipsub 1.3 cell-level deltas) --
+    /// Partial messages received via `Event::Partial` (headers + deltas).
+    partial_messages_received: u64,
+    /// Of those, how many carried a header (phase-1 header-only messages).
+    partial_headers_received: u64,
+    /// New cells merged in from received partials.
+    partial_cells_received: u64,
+    /// Data columns published/seeded via the partial protocol.
+    partial_columns_published: u64,
+    /// Columns that assembled to completion this slot.
+    partial_columns_completed: u64,
+
     // -- Cumulative totals --
     total_el_bytes_sent: u64,
     total_el_bytes_received: u64,
@@ -51,6 +63,11 @@ impl BandwidthMetrics {
             gossip_messages_sent: 0,
             gossip_messages_received: 0,
             gossip_messages_forwarded: 0,
+            partial_messages_received: 0,
+            partial_headers_received: 0,
+            partial_cells_received: 0,
+            partial_columns_published: 0,
+            partial_columns_completed: 0,
             total_el_bytes_sent: 0,
             total_el_bytes_received: 0,
             total_cl_bytes_sent: 0,
@@ -131,6 +148,29 @@ impl BandwidthMetrics {
         self.el_announces_received += 1;
     }
 
+    /// Record a partial data-column message received via `Event::Partial`. The
+    /// payload + metadata bytes count as inbound CL bandwidth; `new_cells` is how
+    /// many previously-missing cells it delivered; `has_header` flags a phase-1
+    /// header-only message.
+    pub fn record_partial_received(&mut self, bytes: usize, new_cells: usize, has_header: bool) {
+        self.cl_bytes_received += bytes as u64;
+        self.partial_messages_received += 1;
+        self.partial_cells_received += new_cells as u64;
+        if has_header {
+            self.partial_headers_received += 1;
+        }
+    }
+
+    /// Record that we published/seeded a data column via the partial protocol.
+    pub fn record_partial_column_published(&mut self) {
+        self.partial_columns_published += 1;
+    }
+
+    /// Record that a data column assembled to completion.
+    pub fn record_partial_column_completed(&mut self) {
+        self.partial_columns_completed += 1;
+    }
+
     // -- Reporting --
 
     /// Emit a structured per-slot summary log line and reset slot counters.
@@ -142,7 +182,10 @@ impl BandwidthMetrics {
              el_requests_sent={} el_responses_received={} \
              el_requests_received={} el_responses_sent={} \
              el_announces_sent={} el_announces_received={} \
-             gossip_sent={} gossip_received={} gossip_forwarded={}",
+             gossip_sent={} gossip_received={} gossip_forwarded={} \
+             partial_msgs_received={} partial_headers_received={} \
+             partial_cells_received={} partial_columns_published={} \
+             partial_columns_completed={}",
             slot,
             self.roles_label,
             self.el_bytes_sent,
@@ -158,6 +201,11 @@ impl BandwidthMetrics {
             self.gossip_messages_sent,
             self.gossip_messages_received,
             self.gossip_messages_forwarded,
+            self.partial_messages_received,
+            self.partial_headers_received,
+            self.partial_cells_received,
+            self.partial_columns_published,
+            self.partial_columns_completed,
         );
 
         // Accumulate into totals
@@ -180,6 +228,11 @@ impl BandwidthMetrics {
         self.gossip_messages_sent = 0;
         self.gossip_messages_received = 0;
         self.gossip_messages_forwarded = 0;
+        self.partial_messages_received = 0;
+        self.partial_headers_received = 0;
+        self.partial_cells_received = 0;
+        self.partial_columns_published = 0;
+        self.partial_columns_completed = 0;
     }
 
     /// Emit a structured end-of-simulation summary log line.

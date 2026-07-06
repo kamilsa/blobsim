@@ -2,45 +2,154 @@
 //!
 //! The state machine drives both networking layers and triggers broadcasts at the
 //! correct phase within each 12-second slot:
-//!   - CL gossip (beacon blocks, payload envelopes, blob sidecars, PTC attestations)
-//!     over the libp2p/QUIC swarm (`network.rs`).
+//!   - CL gossip (beacon block proposals, payload envelopes, blob sidecars, data
+//!     columns) over the libp2p/QUIC swarm (`network.rs`).
 //!   - EL blob propagation (announce → request → serve) over the TCP layer
 //!     (`el_net.rs`).
 
 use crate::el_net::{ElEvent, ElHandle, ElPeerId};
 use crate::metrics::BandwidthMetrics;
 use crate::network::{
-    SimBehaviour, TOPIC_CL_BEACON_BLOCK, TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
-    TOPIC_CL_PTC_ATTESTATION,
+    data_column_topic, subnet_for_column, subnet_from_topic, SimBehaviour, TOPIC_CL_BEACON_BLOCK,
+    TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
+};
+use crate::partial::{
+    OutgoingPartialColumn, PartialColumnAssembler, PartialColumnHeaderTracker,
+    PARTIAL_COLUMNS_VERSION_BYTE,
 };
 use crate::types::*;
 
 use alloy_rlp::Bytes;
 use futures::StreamExt;
-use libp2p::gossipsub::IdentTopic;
+use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Per-slot state tracked during event processing.
-struct SlotState {
-    /// Whether we received an execution payload envelope this slot.
-    payload_received: bool,
+/// How many blocks the partial-column assembler and header tracker retain.
+const ASSEMBLER_CAPACITY: usize = 16;
+const HEADER_TRACKER_CAPACITY: usize = 4;
+/// How many pending blobs the local EL blob pool retains (oldest evicted first).
+const EL_BLOB_POOL_CAPACITY: usize = 64;
+/// How many slots a blob is remembered as already-included, so it is neither
+/// re-pooled nor re-included after a block commits to it (mempool eviction window).
+const INCLUDED_WINDOW_SLOTS: u64 = 4;
+
+/// The local EL blobpool: full blobs this node's EL received over EL networking
+/// (announce → full-payload pulls), keyed by their announced blob hash.
+///
+/// It has two parts:
+///   - `pending`: blobs held but not yet seen in any block. A **builder** takes
+///     up to a per-block cap from here to build a block (their hashes become the
+///     block's commitments); a **partial-column node** matches a block's
+///     commitment hashes against it (the `engine_getBlobs` analog) to derive
+///     custody cells. Bounded to [`EL_BLOB_POOL_CAPACITY`] entries, FIFO.
+///   - `included`: hash → slot for blobs seen included in a block. Once here a
+///     blob is evicted from `pending` and refused re-entry, so it can never be
+///     re-included across slots. Pruned to the last [`INCLUDED_WINDOW_SLOTS`].
+///
+/// Filled only by the EL receiving payloads over EL networking — never by a CL
+/// request.
+#[derive(Default)]
+struct ElBlobPool {
+    pending: std::collections::VecDeque<([u8; 32], Vec<u8>)>,
+    included: std::collections::HashMap<[u8; 32], u64>,
 }
 
-impl SlotState {
-    fn new() -> Self {
+impl ElBlobPool {
+    fn insert(&mut self, hash: [u8; 32], blob: Vec<u8>) {
+        // Don't re-pool a blob already included in a block, or one we already hold.
+        if self.included.contains_key(&hash) || self.get(&hash).is_some() {
+            return;
+        }
+        self.pending.push_back((hash, blob));
+        while self.pending.len() > EL_BLOB_POOL_CAPACITY {
+            self.pending.pop_front();
+        }
+    }
+
+    /// The pooled blob for an announced hash (the local getBlobs read).
+    fn get(&self, hash: &[u8; 32]) -> Option<&Vec<u8>> {
+        self.pending.iter().find(|(h, _)| h == hash).map(|(_, b)| b)
+    }
+
+    /// Record `hash` as included in a block at `slot`: remember it for the
+    /// eviction window and drop it from `pending`. Idempotent.
+    fn mark_included(&mut self, hash: [u8; 32], slot: u64) {
+        self.included.insert(hash, slot);
+        self.pending.retain(|(h, _)| h != &hash);
+    }
+
+    /// Take up to `max` not-yet-included pending blobs for a block at `slot`,
+    /// marking each included (so it is never re-included) and removing it from
+    /// `pending`. Any remainder stays pending for a later slot.
+    fn take_pending(&mut self, max: usize, slot: u64) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut taken = Vec::new();
+        while taken.len() < max {
+            let Some((hash, blob)) = self.pending.pop_front() else {
+                break;
+            };
+            self.included.insert(hash, slot);
+            taken.push((hash, blob));
+        }
+        taken
+    }
+
+    /// Forget inclusions older than [`INCLUDED_WINDOW_SLOTS`] relative to `now`.
+    fn prune_included(&mut self, now: u64) {
+        self.included
+            .retain(|_, &mut slot| now.saturating_sub(slot) < INCLUDED_WINDOW_SLOTS);
+    }
+}
+
+/// Node-local state for the gossipsub 1.3 partial-column path. Inert unless
+/// `--enable-partial-columns` is set (except `custody_columns`, which also
+/// drives the EL sparse-blobpool custody-cell requests).
+struct PartialState {
+    enabled: bool,
+    /// Whether the CL may read blobs from the local EL blob pool to derive its
+    /// custody columns (the `engine_getBlobs` analog). When false, a node relies
+    /// solely on cells arriving from peers over CL (cell-level deltas).
+    get_blobs_enabled: bool,
+    /// This node's custody columns: the cells its EL requests from the sparse
+    /// blobpool, and the column subset it derives/requests on the CL side.
+    custody_columns: Vec<u64>,
+    assembler: PartialColumnAssembler,
+    header_tracker: PartialColumnHeaderTracker,
+    /// Blocks whose custody columns we have already advertised/published once.
+    custody_advertised_blocks: HashSet<[u8; 32]>,
+}
+
+impl PartialState {
+    fn new(enabled: bool, get_blobs_enabled: bool, seed: u64) -> Self {
         Self {
-            payload_received: false,
+            enabled,
+            get_blobs_enabled,
+            custody_columns: custody_columns_for_seed(seed),
+            assembler: PartialColumnAssembler::new(ASSEMBLER_CAPACITY),
+            header_tracker: PartialColumnHeaderTracker::new(HEADER_TRACKER_CAPACITY),
+            custody_advertised_blocks: HashSet::new(),
         }
     }
 }
 
+/// Deterministically pick a node's `CUSTODY_SUBSET_SIZE` custody columns from its seed.
+fn custody_columns_for_seed(seed: u64) -> Vec<u64> {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC057_0DA5_C011_5EED);
+    let mut cols: HashSet<u64> = HashSet::new();
+    while cols.len() < CUSTODY_SUBSET_SIZE {
+        cols.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
+    }
+    cols.into_iter().collect()
+}
+
 /// Run the node's main loop for `num_slots` slots.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_node(
     roles: &NodeRoles,
     swarm: &mut Swarm<SimBehaviour>,
@@ -48,6 +157,8 @@ pub async fn run_node(
     seed: u64,
     num_slots: u64,
     metrics: &mut BandwidthMetrics,
+    enable_partial_columns: bool,
+    disable_get_blobs: bool,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -56,28 +167,61 @@ pub async fn run_node(
     // account fan-out bandwidth when the builder announces blob hashes.
     let mut el_peer_count: usize = 0;
 
-    info!(%roles, num_slots, "starting slot ticker");
+    // Partial data-column state (gossipsub 1.3 cell-level deltas). Inert unless
+    // `--enable-partial-columns` is set.
+    let mut partial_state = PartialState::new(enable_partial_columns, !disable_get_blobs, seed);
+
+    // Full blobs this node's EL receives over EL networking. Builders drain it
+    // to assemble a block's blob set; partial-column nodes read it via the
+    // local getBlobs analog.
+    let mut el_blob_pool = ElBlobPool::default();
+
+    info!(%roles, num_slots, enable_partial_columns, "starting slot ticker");
 
     for slot in 0..num_slots {
         info!(slot, %roles, "=== SLOT START ===");
         let slot_start = Instant::now();
-        let mut slot_state = SlotState::new();
+
+        // Forget inclusions older than the eviction window.
+        el_blob_pool.prune_included(slot);
+
+        // Builder: select up to MAX_BLOBS_PER_BLOCK not-yet-included blobs from
+        // its EL pool to include in this slot's block; `take_pending` marks them
+        // included (so they are never re-included) and leaves any overflow pooled
+        // for a later slot. Builders never generate blob data themselves.
+        let block_blobs: Vec<([u8; 32], Vec<u8>)> = if roles.is_builder() {
+            el_blob_pool.take_pending(MAX_BLOBS_PER_BLOCK, slot)
+        } else {
+            Vec::new()
+        };
+
+        // Commitments naming exactly the pooled blobs (embed their announced EL
+        // hashes), shared by the t=0 proposal and the t=4-6 payload reveal.
+        let commitments: Vec<Vec<u8>> = block_blobs
+            .iter()
+            .map(|(hash, _)| commitment_for_blob_hash(hash))
+            .collect();
 
         // ---------------------------------------------------------------
-        // t=0s — Proposal phase (proposer only)
+        // t=0s — Proposal phase (proposer == builder in this model)
+        //
+        // The proposal commits to the blobs the builder received over EL
+        // networking. Validators that already hold those blobs (matched by hash
+        // against their own EL pool) start propagating columns on seeing it.
         // ---------------------------------------------------------------
         if roles.is_proposer() {
-            // Proposer creates a beacon block containing the builder's signed bid.
-            // In a real network the proposer would select the winning bid from a
-            // relay; here we use a dummy bid with builder_index = 0.
-            let block = SignedBeaconBlock::dummy(slot, node_index, /*builder_index=*/ 0);
+            let block = SignedBeaconBlock::with_commitments(slot, node_index, commitments.clone());
             publish_gossip(
                 swarm,
                 TOPIC_CL_BEACON_BLOCK,
                 &GossipMessage::BeaconBlock(block),
                 metrics,
             );
-            info!(slot, "proposer: published beacon block (containing bid)");
+            info!(
+                slot,
+                blobs = block_blobs.len(),
+                "proposer: published beacon block proposal with blob commitments"
+            );
         }
 
         // Drain events until t=4s
@@ -88,45 +232,92 @@ pub async fn run_node(
             &mut rng,
             slot_start + Duration::from_secs(4),
             metrics,
-            &mut slot_state,
             &mut el_peer_count,
+            &mut partial_state,
+            &mut el_blob_pool,
         )
         .await;
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase (builder only)
         //
-        // By this point the builder has seen the beacon block (containing
-        // its bid) and knows it was selected. It publishes:
-        //   1. Signed execution payload envelope on CL gossip
-        //   2. Blob sidecars on CL gossip
+        // The builder reveals the execution payload envelope and seeds the
+        // block's data columns / blob sidecars. (Validators that already held
+        // the blobs may have started propagating columns earlier, off the t=0
+        // proposal.)
         // ---------------------------------------------------------------
         if roles.is_builder() {
-            // Publish signed execution payload envelope
-            let envelope = SignedExecutionPayloadEnvelope::dummy(slot, node_index);
+            // Publish the payload-reveal envelope. Blob commitments were already
+            // announced in the t=0 proposal, so the envelope doesn't repeat them.
+            let envelope = SignedExecutionPayloadEnvelope::new(slot, node_index);
             publish_gossip(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,
                 &GossipMessage::Envelope(envelope),
                 metrics,
             );
-            info!(slot, "builder: published payload envelope");
-
-            // Publish blob sidecars
-            for i in 0..BLOBS_PER_SLOT as u64 {
-                let sidecar = BlobSidecar::random(slot, i, &mut rng);
-                publish_gossip(
-                    swarm,
-                    TOPIC_CL_BLOB_SIDECAR,
-                    &GossipMessage::Sidecar(sidecar),
-                    metrics,
-                );
-            }
             info!(
                 slot,
-                blobs = BLOBS_PER_SLOT,
-                "builder: published blob sidecars"
+                blobs = block_blobs.len(),
+                "builder: published payload envelope"
             );
+
+            // Wrap the pooled EL blobs as this block's sidecars.
+            let blobs: Vec<BlobSidecar> = block_blobs
+                .iter()
+                .enumerate()
+                .map(|(i, (hash, data))| BlobSidecar {
+                    blob_index: i as u64,
+                    slot,
+                    kzg_commitment: commitment_for_blob_hash(hash),
+                    kzg_proof: vec![0xEE; KZG_ELEMENT_SIZE],
+                    blob_data: data.clone(),
+                })
+                .collect();
+
+            if blobs.is_empty() {
+                // Nothing arrived over EL networking (e.g. no spammer peered).
+                info!(slot, "builder: no pooled EL blobs to include in this block");
+            } else if partial_state.enabled {
+                // Partial path: reshape blobs into data column sidecars and seed
+                // every column via the gossipsub 1.3 partial protocol. The builder
+                // holds all of the block's blobs, so it can seed every column
+                // fully. No full blob sidecars are published on this path.
+                let block_root = block_root_for_slot(slot);
+                let header = PartialDataColumnHeader::from_commitments(commitments);
+                let columns = blobs_to_data_column_sidecars(&blobs, &header);
+                for col in columns {
+                    publish_column_partial(
+                        swarm,
+                        &mut partial_state,
+                        &header,
+                        block_root,
+                        col,
+                        metrics,
+                    );
+                }
+                // The builder already holds everything; mark its custody columns
+                // as advertised so the shared custody path doesn't re-publish.
+                partial_state.custody_advertised_blocks.insert(block_root);
+                info!(
+                    slot,
+                    blobs = blobs.len(),
+                    columns = NUM_CUSTODY_COLUMNS,
+                    "builder: seeded data columns via partial messages"
+                );
+            } else {
+                // Baseline path: publish full 128 KiB blob sidecars.
+                let count = blobs.len();
+                for sidecar in blobs {
+                    publish_gossip(
+                        swarm,
+                        TOPIC_CL_BLOB_SIDECAR,
+                        &GossipMessage::Sidecar(sidecar),
+                        metrics,
+                    );
+                }
+                info!(slot, blobs = count, "builder: published blob sidecars");
+            }
         }
 
         // Drain events until t=6s
@@ -137,51 +328,11 @@ pub async fn run_node(
             &mut rng,
             slot_start + Duration::from_secs(6),
             metrics,
-            &mut slot_state,
             &mut el_peer_count,
+            &mut partial_state,
+            &mut el_blob_pool,
         )
         .await;
-
-        // Drain events until t=8s
-        drain_events_until(
-            swarm,
-            el,
-            roles,
-            &mut rng,
-            slot_start + Duration::from_secs(8),
-            metrics,
-            &mut slot_state,
-            &mut el_peer_count,
-        )
-        .await;
-
-        // ---------------------------------------------------------------
-        // t=8s — PTC vote phase
-        //
-        // PTC members check whether they received the execution payload
-        // envelope from the builder. If so, they vote Present; otherwise
-        // Absent. The builder itself always considers the payload present.
-        // ---------------------------------------------------------------
-        if roles.is_ptc_member() {
-            let payload_status = if slot_state.payload_received || roles.is_builder() {
-                PayloadStatus::Present
-            } else {
-                PayloadStatus::Absent
-            };
-            let attestation = PayloadAttestationMessage {
-                slot,
-                validator_index: seed,
-                payload_status,
-                signature: vec![0xFF; 96],
-            };
-            publish_gossip(
-                swarm,
-                TOPIC_CL_PTC_ATTESTATION,
-                &GossipMessage::PtcAttestation(attestation),
-                metrics,
-            );
-            info!(slot, status = ?payload_status, "ptc: published payload attestation");
-        }
 
         // Drain events until t=12s (slot boundary)
         drain_events_until(
@@ -191,8 +342,9 @@ pub async fn run_node(
             &mut rng,
             slot_start + Duration::from_secs(12),
             metrics,
-            &mut slot_state,
             &mut el_peer_count,
+            &mut partial_state,
+            &mut el_blob_pool,
         )
         .await;
 
@@ -216,7 +368,8 @@ pub async fn run_node(
 /// launched with the same seed still produce distinct blobs, while a given
 /// `(seed, node_id)` pair stays reproducible across runs.
 fn mix_seed(seed: u64, node_id: u64) -> u64 {
-    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(node_id)
+    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(node_id)
 }
 
 /// Run an EL-only blob-spammer node.
@@ -236,6 +389,10 @@ pub async fn run_blob_spammer(
 ) {
     let mut rng = StdRng::seed_from_u64(mix_seed(seed, node_id));
     let mut el_peer_count: usize = 0;
+    // Blob-spammers are EL-only: partial columns are disabled and they are not
+    // builders, so the shared EL handler never pools blobs for them.
+    let partial_state = PartialState::new(false, true, seed);
+    let mut el_blob_pool = ElBlobPool::default();
 
     info!(%roles, num_slots, blobs_per_slot, node_id, "starting blob-spammer");
 
@@ -274,13 +431,28 @@ pub async fn run_blob_spammer(
                 }
                 ev = el.event_rx.recv() => {
                     if let Some(ev) = ev {
-                        handle_el_event(el, roles, &mut rng, ev, metrics, &mut el_peer_count);
+                        // Return is always None (partials disabled for spammers).
+                        let _ = handle_el_event(
+                            el,
+                            roles,
+                            &mut rng,
+                            ev,
+                            metrics,
+                            &mut el_peer_count,
+                            &partial_state,
+                            &mut el_blob_pool,
+                        );
                     }
                 }
             }
         }
 
-        info!(slot, produced, peers = el_peer_count, "spammer: slot complete");
+        info!(
+            slot,
+            produced,
+            peers = el_peer_count,
+            "spammer: slot complete"
+        );
         metrics.emit_slot_summary(slot);
         info!(slot, "=== SLOT END ===");
     }
@@ -305,8 +477,9 @@ async fn drain_events_until(
     rng: &mut StdRng,
     deadline: Instant,
     metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
     el_peer_count: &mut usize,
+    partial_state: &mut PartialState,
+    el_blob_pool: &mut ElBlobPool,
 ) {
     loop {
         tokio::select! {
@@ -314,11 +487,19 @@ async fn drain_events_until(
                 break;
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(swarm, event, metrics, slot_state);
+                handle_swarm_event(swarm, roles, event, metrics, partial_state, el_blob_pool);
             }
             ev = el.event_rx.recv() => {
                 if let Some(ev) = ev {
-                    handle_el_event(el, roles, rng, ev, metrics, el_peer_count);
+                    // A grown blob pool may let us derive more custody cells for
+                    // any block whose header we already know (hash matching).
+                    if handle_el_event(
+                        el, roles, rng, ev, metrics, el_peer_count, partial_state, el_blob_pool,
+                    ) {
+                        for block_root in partial_state.assembler.blocks_with_header() {
+                            ensure_custody_columns(swarm, partial_state, el_blob_pool, block_root, metrics);
+                        }
+                    }
                 }
             }
         }
@@ -330,11 +511,14 @@ async fn drain_events_until(
 // ---------------------------------------------------------------------------
 
 /// Handle a single CL swarm event.
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
-    swarm: &Swarm<SimBehaviour>,
+    swarm: &mut Swarm<SimBehaviour>,
+    roles: &NodeRoles,
     event: SwarmEvent<SimBehaviourEvent>,
     metrics: &mut BandwidthMetrics,
-    slot_state: &mut SlotState,
+    partial_state: &mut PartialState,
+    el_blob_pool: &mut ElBlobPool,
 ) {
     match event {
         // -- Gossipsub message received --
@@ -367,9 +551,119 @@ fn handle_swarm_event(
 
             // Deserialize the wrapper
             if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                handle_gossip_message(msg, slot_state);
+                // On seeing the t=0 proposal, a non-builder validator (a) if
+                // partials are enabled, records the block header and derives/
+                // advertises its custody columns from any of the block's blobs it
+                // already holds (local `engine_getBlobs` — a local read, no fetch),
+                // then (b) evicts those now-included blobs from its EL pool so they
+                // are not re-pooled or re-included later (mempool eviction). Step
+                // (a) must run before (b) so getBlobs can still read the blobs.
+                if !roles.is_builder() {
+                    if let GossipMessage::BeaconBlock(block) = &msg {
+                        // Blobless blocks have no columns to fetch or advertise.
+                        if !block.blob_kzg_commitments.is_empty() {
+                            if partial_state.enabled {
+                                let block_root = block_root_for_slot(block.slot);
+                                // Commitments embed the blobs' hashes so the local
+                                // getBlobs analog can match the pool by hash.
+                                let header = PartialDataColumnHeader::from_commitments(
+                                    block.blob_kzg_commitments.clone(),
+                                );
+                                partial_state.assembler.set_header(block_root, header);
+                                ensure_custody_columns(
+                                    swarm,
+                                    partial_state,
+                                    el_blob_pool,
+                                    block_root,
+                                    metrics,
+                                );
+                            }
+                            for commitment in &block.blob_kzg_commitments {
+                                if let Some(hash) = blob_hash_from_commitment(commitment) {
+                                    el_blob_pool.mark_included(hash, block.slot);
+                                }
+                            }
+                        }
+                    }
+                }
+                handle_gossip_message(msg);
             } else {
                 warn!(%topic, "failed to deserialize gossip message");
+            }
+        }
+
+        // -- Partial data-column message received (gossipsub 1.3) --
+        SwarmEvent::Behaviour(SimBehaviourEvent::Gossipsub(gossipsub::Event::Partial {
+            topic_hash,
+            peer_id,
+            group_id,
+            message,
+            metadata,
+        })) => {
+            let meta_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let subnet = subnet_from_topic(topic_hash.as_str());
+            match (subnet, message) {
+                (Some(subnet), Some(msg)) => {
+                    let bytes = msg.len() + meta_bytes;
+                    match decode_partial(subnet, &group_id, &msg) {
+                        Ok(column) => {
+                            let has_header = column.sidecar.header.is_some();
+                            let result = partial_state.assembler.merge_partial(&column);
+                            metrics.record_partial_received(bytes, result.added_cells, has_header);
+                            debug!(
+                                subnet,
+                                index = column.index,
+                                added_cells = result.added_cells,
+                                has_header,
+                                "partial data column received"
+                            );
+                            if result.newly_complete.is_some() {
+                                metrics.record_partial_column_completed();
+                                debug!(
+                                    subnet,
+                                    index = column.index,
+                                    "data column completed via partials"
+                                );
+                            }
+                            // Once we learn the block header (e.g. before the
+                            // envelope arrived), derive/advertise our custody
+                            // columns so peers send us the cells we lack.
+                            if has_header {
+                                ensure_custody_columns(
+                                    swarm,
+                                    partial_state,
+                                    el_blob_pool,
+                                    column.block_root,
+                                    metrics,
+                                );
+                            }
+                            // Re-publish our accumulated cells so we can serve them
+                            // to other mesh peers (multi-hop cell-delta cross-fill).
+                            if result.added_cells > 0 {
+                                republish_partial_column(
+                                    swarm,
+                                    partial_state,
+                                    column.block_root,
+                                    column.index,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "failed to decode partial column; reporting invalid");
+                            swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .report_invalid_partial(peer_id, &topic_hash);
+                        }
+                    }
+                }
+                // Metadata-only exchange (no payload): account the metadata bytes.
+                (Some(_), None) => {
+                    if meta_bytes > 0 {
+                        metrics.record_partial_received(meta_bytes, 0, false);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -392,16 +686,16 @@ fn handle_swarm_event(
     }
 }
 
-/// Handle a decoded CL gossip message (logging + per-slot state tracking).
-fn handle_gossip_message(msg: GossipMessage, slot_state: &mut SlotState) {
+/// Handle a decoded CL gossip message (logging only; propagation side effects
+/// are driven in `handle_swarm_event`).
+fn handle_gossip_message(msg: GossipMessage) {
     match msg {
         GossipMessage::BeaconBlock(block) => {
             info!(
                 slot = block.slot,
                 proposer = block.proposer_index,
-                builder = block.signed_execution_payload_bid.message.builder_index,
-                bid_gwei = block.signed_execution_payload_bid.message.bid_value_gwei,
-                "received beacon block"
+                commitments = block.blob_kzg_commitments.len(),
+                "received beacon block proposal"
             );
         }
 
@@ -409,10 +703,8 @@ fn handle_gossip_message(msg: GossipMessage, slot_state: &mut SlotState) {
             info!(
                 slot = env.slot,
                 builder = env.builder_index,
-                commitments = env.blob_kzg_commitments.len(),
                 "received payload envelope"
             );
-            slot_state.payload_received = true;
         }
 
         GossipMessage::Sidecar(sidecar) => {
@@ -420,15 +712,6 @@ fn handle_gossip_message(msg: GossipMessage, slot_state: &mut SlotState) {
                 slot = sidecar.slot,
                 blob_index = sidecar.blob_index,
                 "received blob sidecar"
-            );
-        }
-
-        GossipMessage::PtcAttestation(att) => {
-            info!(
-                slot = att.slot,
-                validator = att.validator_index,
-                status = ?att.payload_status,
-                "received PTC attestation"
             );
         }
     }
@@ -439,6 +722,14 @@ fn handle_gossip_message(msg: GossipMessage, slot_state: &mut SlotState) {
 // ---------------------------------------------------------------------------
 
 /// Handle a single EL/TCP event.
+///
+/// Full blobs this node's EL receives (via the normal EL announce → pull flow)
+/// are added to the local EL blob pool, keyed by announced hash: builders
+/// include them in their next block, and partial-column nodes read them via the
+/// local `engine_getBlobs` analog. Returns `true` when the pool grew and a
+/// partial-column node should re-check its known blocks for newly derivable
+/// cells. Blob-spammers pass a disabled `partial_state` and never pool.
+#[allow(clippy::too_many_arguments)]
 fn handle_el_event(
     el: &ElHandle,
     roles: &NodeRoles,
@@ -446,26 +737,72 @@ fn handle_el_event(
     event: ElEvent,
     metrics: &mut BandwidthMetrics,
     el_peer_count: &mut usize,
-) {
+    partial_state: &PartialState,
+    el_blob_pool: &mut ElBlobPool,
+) -> bool {
     match event {
         ElEvent::PeerConnected(peer) => {
             *el_peer_count += 1;
             info!(peer, peers = *el_peer_count, "EL: peer connected");
+            false
         }
         ElEvent::PeerDisconnected(peer) => {
             *el_peer_count = el_peer_count.saturating_sub(1);
             info!(peer, peers = *el_peer_count, "EL: peer disconnected");
+            false
         }
         ElEvent::Message { from, msg, bytes } => {
-            handle_el_message(el, roles, rng, from, msg, bytes, metrics);
+            let pools_blobs =
+                roles.is_builder() || (partial_state.enabled && partial_state.get_blobs_enabled);
+            if pools_blobs {
+                if let ElMessage::FullPayloadResponse(resp) = &msg {
+                    metrics.record_response_received(bytes);
+                    info!(
+                        slot = resp.slot,
+                        payload_size = resp.payload_data.len(),
+                        from,
+                        "EL: received full payload (added to local blob pool)"
+                    );
+                    if resp.blob_hash.len() == 32 {
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&resp.blob_hash);
+                        el_blob_pool.insert(hash, resp.payload_data.to_vec());
+                    } else {
+                        warn!(
+                            from,
+                            "EL: full payload with malformed blob hash; not pooled"
+                        );
+                    }
+                    // Newly pooled blobs may let a partial-column node derive
+                    // more custody cells right away. (Builders consume the pool
+                    // at slot start instead.)
+                    return !roles.is_builder()
+                        && partial_state.enabled
+                        && partial_state.get_blobs_enabled;
+                }
+            }
+            serve_el_message(
+                el,
+                roles,
+                &partial_state.custody_columns,
+                rng,
+                from,
+                msg,
+                bytes,
+                metrics,
+            );
+            false
         }
     }
 }
 
-/// Dispatch an inbound EL message based on type and this node's roles.
-fn handle_el_message(
+/// Dispatch an inbound EL message based on type and this node's roles. Handles
+/// serving (announce reactions, request → response) without touching the CL.
+#[allow(clippy::too_many_arguments)]
+fn serve_el_message(
     el: &ElHandle,
     roles: &NodeRoles,
+    custody_columns: &[u64],
     rng: &mut StdRng,
     from: ElPeerId,
     msg: ElMessage,
@@ -483,9 +820,11 @@ fn handle_el_message(
                 "EL: received blob hash announce"
             );
             if roles.is_sampler() {
-                send_custody_requests(el, rng, from, &announce, metrics);
+                send_custody_requests(el, custody_columns, rng, from, &announce, metrics);
             }
-            if roles.is_provider() {
+            // Builders always behave as providers: they must hold the full blob
+            // data to include the blobs in the next block they build.
+            if roles.is_provider() || roles.is_builder() {
                 send_full_payload_requests(el, from, &announce, metrics);
             }
         }
@@ -547,20 +886,19 @@ fn handle_el_message(
     }
 }
 
-/// Sampler: request a deterministic subset of custody columns (+1 random extra)
-/// from the announcing peer, for each announced blob hash.
+/// Sampler: request this node's custody columns (+1 random extra) from the
+/// announcing peer, for each announced blob hash. Sparse blobpool (EIP-8070):
+/// peers only pull the cells corresponding to their custody set.
 fn send_custody_requests(
     el: &ElHandle,
+    custody_columns: &[u64],
     rng: &mut StdRng,
     peer: ElPeerId,
     announce: &BlobHashAnnounce,
     metrics: &mut BandwidthMetrics,
 ) {
-    // Deterministically choose custody columns + 1 random extra.
-    let mut columns: HashSet<u64> = HashSet::new();
-    while columns.len() < CUSTODY_SUBSET_SIZE {
-        columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
-    }
+    // The node's stable custody set + 1 random extra.
+    let mut columns: HashSet<u64> = custody_columns.iter().copied().collect();
     columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
     let column_indices: Vec<u64> = columns.into_iter().collect();
 
@@ -627,6 +965,267 @@ fn publish_gossip(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Partial data-column helpers (gossipsub 1.3 cell-level deltas)
+// ---------------------------------------------------------------------------
+
+/// Ensure this node's custody columns for a block are registered and published
+/// via the partial protocol, folding in any full blobs the local EL already
+/// holds.
+///
+/// The pool read is our `engine_getBlobs` analog: a *local* Engine API call to
+/// the node's own EL (whose pool was filled earlier over EL networking), never a
+/// network request — so it adds no CL/EL traffic. Idempotent and incremental:
+/// safe to call at envelope arrival, at header arrival, and again whenever the
+/// pool grows; each call merges newly-derivable cells and republishes columns
+/// that gained cells. Cells still missing are advertised as requests, so peers
+/// deliver them over CL as cell-level deltas.
+fn ensure_custody_columns(
+    swarm: &mut Swarm<SimBehaviour>,
+    partial_state: &mut PartialState,
+    el_blob_pool: &ElBlobPool,
+    block_root: [u8; 32],
+    metrics: &mut BandwidthMetrics,
+) {
+    if !partial_state.enabled {
+        return;
+    }
+    let Some(header) = partial_state.assembler.get_header(&block_root) else {
+        return;
+    };
+    let num_blobs = header.kzg_commitments.len();
+    let first_time = partial_state.custody_advertised_blocks.insert(block_root);
+
+    // Local getBlobs: the block's commitments embed the announced hashes of its
+    // blobs — match each against what our EL has pooled. Blob position i in the
+    // block maps to bitmap bit i, so derived cells land at the right index.
+    let slot = slot_for_block_root(&block_root);
+    let pool_blobs: Vec<Option<Vec<u8>>> = if partial_state.get_blobs_enabled {
+        header
+            .kzg_commitments
+            .iter()
+            .map(|c| blob_hash_from_commitment(c).and_then(|hash| el_blob_pool.get(&hash).cloned()))
+            .collect()
+    } else {
+        vec![None; num_blobs]
+    };
+    if !first_time && pool_blobs.iter().all(Option::is_none) {
+        return;
+    }
+
+    let custody = partial_state.custody_columns.clone();
+    let mut pool_cells_added = 0usize;
+    for &index in &custody {
+        // Partial column from the pooled blobs: bit i set iff we have blob i.
+        let mut bitmap = CellBitmap::with_len(num_blobs);
+        let mut column = Vec::new();
+        let mut kzg_proofs = Vec::new();
+        for (i, blob) in pool_blobs.iter().enumerate() {
+            let Some(blob) = blob else { continue };
+            bitmap.set(i);
+            column.push(derive_cell(blob, index));
+            kzg_proofs.push(vec![0xEE; KZG_ELEMENT_SIZE]);
+        }
+        let partial = Arc::new(PartialDataColumn {
+            block_root,
+            index,
+            sidecar: PartialDataColumnSidecar {
+                cells_present_bitmap: bitmap,
+                column,
+                kzg_proofs,
+                header: None,
+            },
+        });
+        let result = partial_state.assembler.merge_partial(&partial);
+        pool_cells_added += result.added_cells;
+        if first_time || result.added_cells > 0 {
+            if first_time && partial.sidecar.num_present() > 0 {
+                metrics.record_partial_column_published();
+            }
+            republish_partial_column(swarm, partial_state, block_root, index);
+        }
+    }
+    if pool_cells_added > 0 {
+        info!(
+            slot,
+            cells = pool_cells_added,
+            "getBlobs: derived custody cells from local EL blob pool"
+        );
+    } else if first_time {
+        debug!(
+            slot,
+            custody = custody.len(),
+            "advertised custody column requests over CL"
+        );
+    }
+}
+
+/// Publish one full data column via the gossipsub 1.3 partial protocol, recording
+/// locally that we now hold its cells.
+fn publish_column_partial(
+    swarm: &mut Swarm<SimBehaviour>,
+    partial_state: &mut PartialState,
+    header: &PartialDataColumnHeader,
+    block_root: [u8; 32],
+    col: DataColumnSidecar,
+    metrics: &mut BandwidthMetrics,
+) {
+    let index = col.index;
+    let num_blobs = col.column.len();
+    let sidecar = PartialDataColumnSidecar {
+        cells_present_bitmap: CellBitmap::all_set(num_blobs),
+        column: col.column,
+        kzg_proofs: col.kzg_proofs,
+        header: None,
+    };
+    let partial_column = Arc::new(PartialDataColumn {
+        block_root,
+        index,
+        sidecar,
+    });
+
+    // Track locally that we hold this column's cells.
+    partial_state
+        .assembler
+        .set_header(block_root, header.clone());
+    partial_state.assembler.merge_partial(&partial_column);
+
+    let header_sent = partial_state.header_tracker.get_for_block(block_root);
+    let request_cells = CellBitmap::all_set(num_blobs);
+    let outgoing = OutgoingPartialColumn::new(
+        Arc::clone(&partial_column),
+        header,
+        header_sent,
+        request_cells,
+    );
+
+    let topic = data_column_topic(subnet_for_column(index));
+    match swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish_partial(topic.hash(), outgoing)
+    {
+        Ok(()) => metrics.record_partial_column_published(),
+        Err(e) => debug!(index, error = %e, "publish_partial failed"),
+    }
+}
+
+/// Re-publish our current (possibly incomplete) partial for a column so the
+/// gossipsub behaviour will serve our accumulated cells to peers. This is what
+/// makes cell-level deltas cross-fill across multiple hops.
+fn republish_partial_column(
+    swarm: &mut Swarm<SimBehaviour>,
+    partial_state: &mut PartialState,
+    block_root: [u8; 32],
+    index: u64,
+) {
+    let Some(header) = partial_state.assembler.get_header(&block_root) else {
+        return;
+    };
+    let Some(partial) = partial_state.assembler.current_partial(&block_root, index) else {
+        return;
+    };
+    let num_blobs = partial.sidecar.cells_present_bitmap.len();
+    let header_sent = partial_state.header_tracker.get_for_block(block_root);
+    // We still want every cell we don't yet hold.
+    let request_cells = CellBitmap::all_set(num_blobs);
+    let outgoing =
+        OutgoingPartialColumn::new(Arc::new(partial), &header, header_sent, request_cells);
+    let topic = data_column_topic(subnet_for_column(index));
+    let _ = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish_partial(topic.hash(), outgoing);
+}
+
+/// Decode a gossipsub `Event::Partial` payload into a [`PartialDataColumn`]. The
+/// column index comes from the topic's subnet (1:1 under Fulu); the block root
+/// comes from the group id (`0x00 || block_root`).
+fn decode_partial(subnet: u64, group_id: &[u8], data: &[u8]) -> Result<PartialDataColumn, String> {
+    if group_id.first() != Some(&PARTIAL_COLUMNS_VERSION_BYTE) {
+        return Err(format!("unknown group id version: {:?}", group_id.first()));
+    }
+    if group_id.len() != 33 {
+        return Err(format!("bad group id length {}", group_id.len()));
+    }
+    let mut block_root = [0u8; 32];
+    block_root.copy_from_slice(&group_id[1..33]);
+    let sidecar =
+        PartialDataColumnSidecar::decode(data).map_err(|e| format!("decode sidecar: {e}"))?;
+    Ok(PartialDataColumn {
+        block_root,
+        index: subnet,
+        sidecar,
+    })
+}
+
 // Re-export the generated event type for the combined behaviour.
 use crate::network::SimBehaviourEvent;
-use libp2p::gossipsub;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(n: u8) -> [u8; 32] {
+        let mut x = [0u8; 32];
+        x[0] = n;
+        x
+    }
+
+    #[test]
+    fn take_pending_caps_carries_forward_and_never_reincludes() {
+        let mut pool = ElBlobPool::default();
+        for i in 0..9 {
+            pool.insert(h(i), vec![i]);
+        }
+        // Slot 0 includes the cap (6); the other 3 stay pending.
+        let s0 = pool.take_pending(MAX_BLOBS_PER_BLOCK, 0);
+        assert_eq!(s0.len(), 6);
+        // Slot 1 gets the remaining 3 — none of slot 0's blobs come back.
+        let s1 = pool.take_pending(MAX_BLOBS_PER_BLOCK, 1);
+        assert_eq!(s1.len(), 3);
+        // Slot 2 has nothing left; no blob is ever included twice.
+        assert!(pool.take_pending(MAX_BLOBS_PER_BLOCK, 2).is_empty());
+        let mut all: Vec<[u8; 32]> = s0.iter().chain(&s1).map(|(hash, _)| *hash).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 9, "all included hashes are distinct");
+    }
+
+    #[test]
+    fn included_blob_is_refused_re_entry() {
+        let mut pool = ElBlobPool::default();
+        pool.insert(h(1), vec![1]);
+        assert_eq!(pool.take_pending(MAX_BLOBS_PER_BLOCK, 0).len(), 1);
+        // Re-announced after inclusion → not re-pooled, not re-included.
+        pool.insert(h(1), vec![1]);
+        assert!(pool.get(&h(1)).is_none());
+        assert!(pool.take_pending(MAX_BLOBS_PER_BLOCK, 1).is_empty());
+    }
+
+    #[test]
+    fn mark_included_evicts_from_pending() {
+        let mut pool = ElBlobPool::default();
+        pool.insert(h(2), vec![2]);
+        assert!(pool.get(&h(2)).is_some());
+        pool.mark_included(h(2), 0);
+        assert!(pool.get(&h(2)).is_none());
+        // And it won't be re-poolable within the window.
+        pool.insert(h(2), vec![2]);
+        assert!(pool.get(&h(2)).is_none());
+    }
+
+    #[test]
+    fn prune_forgets_inclusion_after_window() {
+        let mut pool = ElBlobPool::default();
+        pool.mark_included(h(3), 0);
+        // Still within the 4-slot window → remembered.
+        pool.prune_included(INCLUDED_WINDOW_SLOTS - 1);
+        pool.insert(h(3), vec![3]);
+        assert!(pool.get(&h(3)).is_none());
+        // Window elapsed → forgotten, re-poolable.
+        pool.prune_included(INCLUDED_WINDOW_SLOTS);
+        pool.insert(h(3), vec![3]);
+        assert!(pool.get(&h(3)).is_some());
+    }
+}

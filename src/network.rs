@@ -7,6 +7,7 @@
 //! The network module is strictly decoupled from the state machine — it builds and
 //! configures the swarm, and the state machine drives it via the event loop.
 
+use crate::types::DATA_COLUMN_SIDECAR_SUBNET_COUNT;
 use libp2p::{
     gossipsub::{self, IdentTopic, MessageAuthenticity},
     identity,
@@ -26,16 +27,42 @@ pub const TOPIC_CL_BEACON_BLOCK: &str = "/cl/beacon_block/1";
 pub const TOPIC_CL_PAYLOAD_ENVELOPE: &str = "/cl/payload_envelope/1";
 /// CL topic: blob sidecars.
 pub const TOPIC_CL_BLOB_SIDECAR: &str = "/cl/blob_sidecar/1";
-/// CL topic: PTC attestation messages.
-pub const TOPIC_CL_PTC_ATTESTATION: &str = "/cl/ptc_attestation/1";
 
-/// All topics a node should subscribe to.
+/// CL topic prefix for data column sidecars (one gossipsub subnet per column
+/// under Fulu): `/cl/data_column_sidecar/{subnet}/1`.
+pub const TOPIC_CL_DATA_COLUMN_PREFIX: &str = "/cl/data_column_sidecar";
+
+/// Gossipsub topic for a data column subnet.
+pub fn data_column_topic(subnet: u64) -> IdentTopic {
+    IdentTopic::new(format!("{TOPIC_CL_DATA_COLUMN_PREFIX}/{subnet}/1"))
+}
+
+/// Map a column index to its data column subnet.
+pub fn subnet_for_column(index: u64) -> u64 {
+    index % DATA_COLUMN_SIDECAR_SUBNET_COUNT
+}
+
+/// Parse the subnet id out of a data column topic string, if it is one.
+pub fn subnet_from_topic(topic: &str) -> Option<u64> {
+    let rest = topic.strip_prefix(TOPIC_CL_DATA_COLUMN_PREFIX)?;
+    // rest is like "/{subnet}/1"
+    let mut parts = rest.trim_start_matches('/').split('/');
+    parts.next()?.parse().ok()
+}
+
+/// All data column subnet topics.
+pub fn all_data_column_topics() -> Vec<IdentTopic> {
+    (0..DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+        .map(data_column_topic)
+        .collect()
+}
+
+/// The always-on CL topics (baseline full-message path).
 pub fn all_topics() -> Vec<IdentTopic> {
     vec![
         IdentTopic::new(TOPIC_CL_BEACON_BLOCK),
         IdentTopic::new(TOPIC_CL_PAYLOAD_ENVELOPE),
         IdentTopic::new(TOPIC_CL_BLOB_SIDECAR),
-        IdentTopic::new(TOPIC_CL_PTC_ATTESTATION),
     ]
 }
 
@@ -93,6 +120,11 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
         .gossip_lazy(6)
         .history_length(5)
         .history_gossip(3)
+        // Full 128 KiB blob sidecars (and their JSON envelope) exceed gossipsub's
+        // default 64 KiB transmit limit, which would silently drop them. Raise the
+        // ceiling so both the baseline full-sidecar path and partial cell messages
+        // actually propagate.
+        .max_transmit_size(16 * 1024 * 1024)
         .validation_mode(gossipsub::ValidationMode::Permissive)
         .build()
         .expect("valid gossipsub config");
@@ -127,7 +159,12 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
 }
 
 /// Subscribe the swarm to all simulation gossipsub topics.
-pub fn subscribe_all(swarm: &mut Swarm<SimBehaviour>) {
+///
+/// When `enable_partial_columns` is set, data column sidecar topics are joined
+/// via [`subscribe_partial`] (enabling the gossipsub 1.3 partial-message
+/// protocol) so blobs propagate as cell-level deltas. Otherwise only the
+/// baseline full-message topics are joined.
+pub fn subscribe_all(swarm: &mut Swarm<SimBehaviour>, enable_partial_columns: bool) {
     for topic in all_topics() {
         swarm
             .behaviour_mut()
@@ -136,6 +173,26 @@ pub fn subscribe_all(swarm: &mut Swarm<SimBehaviour>) {
             .expect("subscribe to topic");
         info!(topic = %topic, "subscribed");
     }
+
+    if enable_partial_columns {
+        for topic in all_data_column_topics() {
+            subscribe_partial(swarm, &topic);
+        }
+        info!(
+            subnets = DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+            "subscribed to data column subnets with partial messages enabled"
+        );
+    }
+}
+
+/// Subscribe to a topic with the gossipsub 1.3 partial-message protocol enabled.
+///
+/// `enable_partials_for_topic` must be called *before* `subscribe` — the
+/// behaviour ignores it once the topic is already in the mesh.
+pub fn subscribe_partial(swarm: &mut Swarm<SimBehaviour>, topic: &IdentTopic) {
+    let gossipsub = &mut swarm.behaviour_mut().gossipsub;
+    gossipsub.enable_partials_for_topic(topic.hash(), true);
+    gossipsub.subscribe(topic).expect("subscribe partial topic");
 }
 
 /// Dial a list of bootstrap peer multiaddrs.

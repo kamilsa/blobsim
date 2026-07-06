@@ -6,6 +6,7 @@
 mod el_net;
 mod metrics;
 mod network;
+mod partial;
 mod state_machine;
 mod types;
 
@@ -28,8 +29,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "blob-sim", version, about)]
 struct Cli {
-    /// Node role (repeatable): builder, sampler, provider, ptc.
-    /// Sampler and provider are mutually exclusive.
+    /// Node role (repeatable): proposer, builder, sampler, provider, blob-spammer.
+    /// Sampler and provider are mutually exclusive; a proposer is also a builder.
     #[arg(long = "role", required = true)]
     roles: Vec<Role>,
 
@@ -66,6 +67,23 @@ struct Cli {
     /// same --seed still produce distinct blobs. The launcher assigns a unique value.
     #[arg(long = "node-id", default_value_t = 0)]
     node_id: u64,
+
+    /// Enable gossipsub 1.3 partial messages + cell-level deltas for CL blob
+    /// propagation (data column sidecars). When set, nodes subscribe to the data
+    /// column subnets with the partial protocol and derive custody columns from
+    /// blobs already held by the local EL (`engine_getBlobs` analog — a local
+    /// read, not a network fetch); when unset, only the baseline full
+    /// blob-sidecar path is used.
+    #[arg(long = "enable-partial-columns", default_value_t = false)]
+    enable_partial_columns: bool,
+
+    /// Disable the local `engine_getBlobs` analog (mirrors Lighthouse's
+    /// `--disable-get-blobs`). With `--enable-partial-columns`, a node then
+    /// ignores its local EL blob pool and pulls all of its custody columns'
+    /// cells from peers over CL as cell-level deltas. No effect unless partial
+    /// columns are enabled.
+    #[arg(long = "disable-get-blobs", default_value_t = false)]
+    disable_get_blobs: bool,
 }
 
 #[tokio::main]
@@ -114,8 +132,9 @@ async fn main() {
     let (mut swarm, local_peer_id) = build_swarm(cli.seed, cli.port);
     info!(%local_peer_id, "swarm built");
 
-    // Subscribe to all gossipsub topics
-    subscribe_all(&mut swarm);
+    // Subscribe to all gossipsub topics (data column subnets use partial
+    // messages when --enable-partial-columns is set).
+    subscribe_all(&mut swarm, cli.enable_partial_columns);
 
     // Dial bootstrap peers
     if !cli.peers.is_empty() {
@@ -136,6 +155,8 @@ async fn main() {
         cli.seed,
         cli.slots,
         &mut metrics,
+        cli.enable_partial_columns,
+        cli.disable_get_blobs,
     )
     .await;
 }
