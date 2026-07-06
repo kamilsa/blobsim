@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # run_network.sh — Launch a local blob-sim network without Shadow.
 #
-# Starts one proposer+builder and a configurable number of samplers and
-# providers. (A proposer is also a builder; there is no bid.)
+# Starts one proposer+builder and a configurable number of validator nodes.
+# Non-builder validators choose sampler/provider fetch behavior per blob.
 #
 # Each node connects to --peers-per-node randomly chosen other nodes
 # (always including the proposer/builder).
@@ -11,8 +11,7 @@
 #   ./run_network.sh [OPTIONS]
 #
 # Options:
-#   --samplers N        Number of sampler nodes       (default: 85)
-#   --providers N       Number of provider nodes       (default: 15)
+#   --validators N      Number of validator nodes     (default: 100)
 #   --peers-per-node N  Random peers each node dials   (default: 3)
 #   --slots N           Slots per node                 (default: 10)
 #   --base-port N       First port (builder)           (default: 9000)
@@ -23,8 +22,7 @@
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────
-SAMPLERS=85
-PROVIDERS=15
+VALIDATORS=100
 PEERS_PER_NODE=3
 SLOTS=10
 BASE_PORT=9000
@@ -38,8 +36,7 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --samplers)        SAMPLERS=$2;        shift 2;;
-        --providers)       PROVIDERS=$2;       shift 2;;
+        --validators)      VALIDATORS=$2;      shift 2;;
         --peers-per-node)  PEERS_PER_NODE=$2;  shift 2;;
         --slots)           SLOTS=$2;           shift 2;;
         --base-port)       BASE_PORT=$2;       shift 2;;
@@ -50,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-TOTAL=$((SAMPLERS + PROVIDERS))
+TOTAL=$VALIDATORS
 
 # ── Build ────────────────────────────────────────────────────────────
 echo "Building blob-sim${RELEASE:+ (release)}..."
@@ -88,7 +85,7 @@ start_node() {
 }
 
 # ── Collect all node ports ───────────────────────────────────────────
-# Order: proposer+builder, then samplers + providers
+# Order: proposer+builder, then validators
 PROPOSER_PORT=$BASE_PORT
 ALL_PORTS=("$PROPOSER_PORT")
 
@@ -147,21 +144,10 @@ start_node "proposer-builder" --role proposer --role builder \
 PORT=$((BASE_PORT + 1))
 SEED=100
 
-# ── Launch samplers ──────────────────────────────────────────────────
-for i in $(seq 1 "$SAMPLERS"); do
-    name="sampler$(printf '%03d' "$i")"
-    roles=(--role sampler)
-    collect_peers "$PORT" "$SEED"
-    start_node "$name" "${roles[@]}" --port "$PORT" --seed "$SEED" --slots "$SLOTS" \
-        "${_PEERS[@]}"
-    PORT=$((PORT + 1))
-    SEED=$((SEED + 1))
-done
-
-# ── Launch providers ─────────────────────────────────────────────────
-for i in $(seq 1 "$PROVIDERS"); do
-    name="provider$(printf '%03d' "$i")"
-    roles=(--role provider)
+# ── Launch validators ────────────────────────────────────────────────
+for i in $(seq 1 "$VALIDATORS"); do
+    name="validator$(printf '%03d' "$i")"
+    roles=(--role validator)
     collect_peers "$PORT" "$SEED"
     start_node "$name" "${roles[@]}" --port "$PORT" --seed "$SEED" --slots "$SLOTS" \
         "${_PEERS[@]}"
@@ -170,11 +156,10 @@ for i in $(seq 1 "$PROVIDERS"); do
 done
 
 # ── Summary ──────────────────────────────────────────────────────────
-TOTAL_NODES=$((1 + SAMPLERS + PROVIDERS))
+TOTAL_NODES=$((1 + VALIDATORS))
 echo "Network launched: ${TOTAL_NODES} nodes, ${PEERS_PER_NODE} peers/node"
 echo "  1 proposer+builder (port ${PROPOSER_PORT})"
-echo "  ${SAMPLERS} samplers"
-echo "  ${PROVIDERS} providers"
+echo "  ${VALIDATORS} validators"
 echo "  ${SLOTS} slots, logs in ${LOG_DIR}/"
 echo ""
 echo "Waiting for ${SLOTS} slots to complete (Ctrl+C to stop early)..."

@@ -39,6 +39,9 @@ const EL_BLOB_POOL_CAPACITY: usize = 64;
 /// How many slots a blob is remembered as already-included, so it is neither
 /// re-pooled nor re-included after a block commits to it (mempool eviction window).
 const INCLUDED_WINDOW_SLOTS: u64 = 4;
+/// Per-announced-blob probability that a non-builder CL node fetches custody
+/// cells instead of the full payload.
+const SAMPLER_FETCH_PROBABILITY: f64 = 0.85;
 
 /// The local EL blobpool: full blobs this node's EL received over EL networking
 /// (announce → full-payload pulls), keyed by their announced blob hash.
@@ -109,7 +112,7 @@ impl ElBlobPool {
 
 /// Node-local state for the gossipsub 1.3 partial-column path. Inert unless
 /// `--enable-partial-columns` is set (except `custody_columns`, which also
-/// drives the EL sparse-blobpool custody-cell requests).
+/// drives EL sparse-blobpool custody-cell requests).
 struct PartialState {
     enabled: bool,
     /// Whether the CL may read blobs from the local EL blob pool to derive its
@@ -810,7 +813,7 @@ fn serve_el_message(
     metrics: &mut BandwidthMetrics,
 ) {
     match msg {
-        // -- Blob hash announcement: samplers/providers pull what they need --
+        // -- Blob hash announcement: peers pull what they need per blob --
         ElMessage::Announce(announce) => {
             metrics.record_el_announce_received(bytes);
             info!(
@@ -819,13 +822,19 @@ fn serve_el_message(
                 from,
                 "EL: received blob hash announce"
             );
-            if roles.is_sampler() {
-                send_custody_requests(el, custody_columns, rng, from, &announce, metrics);
-            }
             // Builders always behave as providers: they must hold the full blob
             // data to include the blobs in the next block they build.
-            if roles.is_provider() || roles.is_builder() {
+            if roles.is_builder() {
                 send_full_payload_requests(el, from, &announce, metrics);
+            } else if !roles.is_blob_spammer() {
+                send_random_sparse_blobpool_requests(
+                    el,
+                    custody_columns,
+                    rng,
+                    from,
+                    &announce,
+                    metrics,
+                );
             }
         }
 
@@ -864,7 +873,7 @@ fn serve_el_message(
             el.send(from, response);
         }
 
-        // -- Incoming responses (sampler/provider side) --
+        // -- Incoming responses (requesting side) --
         ElMessage::CustodyResponse(resp) => {
             metrics.record_response_received(bytes);
             info!(
@@ -886,10 +895,10 @@ fn serve_el_message(
     }
 }
 
-/// Sampler: request this node's custody columns (+1 random extra) from the
-/// announcing peer, for each announced blob hash. Sparse blobpool (EIP-8070):
-/// peers only pull the cells corresponding to their custody set.
-fn send_custody_requests(
+/// Non-builder CL node: independently choose sampler/provider behavior for each
+/// announced blob hash. Sparse blobpool (EIP-8070) has most blobs fetched as
+/// custody cells, while a smaller fraction are fetched as full payloads.
+fn send_random_sparse_blobpool_requests(
     el: &ElHandle,
     custody_columns: &[u64],
     rng: &mut StdRng,
@@ -897,25 +906,51 @@ fn send_custody_requests(
     announce: &BlobHashAnnounce,
     metrics: &mut BandwidthMetrics,
 ) {
+    for blob_hash in &announce.blob_hashes {
+        if rng.gen_bool(SAMPLER_FETCH_PROBABILITY) {
+            send_custody_request(
+                el,
+                custody_columns,
+                rng,
+                peer,
+                announce.slot,
+                blob_hash,
+                metrics,
+            );
+        } else {
+            send_full_payload_request(el, peer, announce.slot, blob_hash, metrics);
+        }
+    }
+}
+
+/// Sampler behavior: request this node's custody columns (+1 random extra) from
+/// the announcing peer for one announced blob hash.
+fn send_custody_request(
+    el: &ElHandle,
+    custody_columns: &[u64],
+    rng: &mut StdRng,
+    peer: ElPeerId,
+    slot: u64,
+    blob_hash: &Bytes,
+    metrics: &mut BandwidthMetrics,
+) {
     // The node's stable custody set + 1 random extra.
     let mut columns: HashSet<u64> = custody_columns.iter().copied().collect();
     columns.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
     let column_indices: Vec<u64> = columns.into_iter().collect();
 
-    for blob_hash in &announce.blob_hashes {
-        let request = ElMessage::CustodyRequest(CustodyCellRequest {
-            slot: announce.slot,
-            blob_hash: blob_hash.clone(),
-            column_indices: column_indices.clone(),
-        });
-        let req_bytes = request.encode().len() + 4;
-        info!(slot = announce.slot, columns = ?column_indices, peer, req_bytes, "sampler: sending custody cell request");
-        metrics.record_request_sent(req_bytes);
-        el.send(peer, request);
-    }
+    let request = ElMessage::CustodyRequest(CustodyCellRequest {
+        slot,
+        blob_hash: blob_hash.clone(),
+        column_indices: column_indices.clone(),
+    });
+    let req_bytes = request.encode().len() + 4;
+    info!(slot, columns = ?column_indices, peer, req_bytes, "sampler: sending custody cell request");
+    metrics.record_request_sent(req_bytes);
+    el.send(peer, request);
 }
 
-/// Provider: request the full payload from the announcing peer, per blob hash.
+/// Provider behavior: request full payloads from the announcing peer.
 fn send_full_payload_requests(
     el: &ElHandle,
     peer: ElPeerId,
@@ -923,18 +958,29 @@ fn send_full_payload_requests(
     metrics: &mut BandwidthMetrics,
 ) {
     for blob_hash in &announce.blob_hashes {
-        let request = ElMessage::FullPayloadRequest(FullPayloadRequest {
-            slot: announce.slot,
-            blob_hash: blob_hash.clone(),
-        });
-        let req_bytes = request.encode().len() + 4;
-        info!(
-            slot = announce.slot,
-            peer, req_bytes, "provider: sending full payload request"
-        );
-        metrics.record_request_sent(req_bytes);
-        el.send(peer, request);
+        send_full_payload_request(el, peer, announce.slot, blob_hash, metrics);
     }
+}
+
+/// Provider behavior: request the full payload for one announced blob hash.
+fn send_full_payload_request(
+    el: &ElHandle,
+    peer: ElPeerId,
+    slot: u64,
+    blob_hash: &Bytes,
+    metrics: &mut BandwidthMetrics,
+) {
+    let request = ElMessage::FullPayloadRequest(FullPayloadRequest {
+        slot,
+        blob_hash: blob_hash.clone(),
+    });
+    let req_bytes = request.encode().len() + 4;
+    info!(
+        slot,
+        peer, req_bytes, "provider: sending full payload request"
+    );
+    metrics.record_request_sent(req_bytes);
+    el.send(peer, request);
 }
 
 // ---------------------------------------------------------------------------

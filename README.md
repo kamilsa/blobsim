@@ -30,16 +30,16 @@ The networking layer (`network.rs`) is strictly decoupled from the state machine
 
 Protocol `/sim/devp2p/1` with JSON codec, carrying `CustodyCellRequest`/`FullPayloadRequest` and their responses.
 
-## Node Personas
+## Node Roles
 
-Each node is configured at startup to act as one of the following:
+Each node is configured at startup with one or more roles:
 
-| Persona | Behaviour |
+| Role | Behaviour |
 |---|---|
-| **Builder** | Publishes bids at t=0s, releases payload envelope + blob sidecars at t=4-6s, responds to data requests |
-| **Sampler** | (85% of network) On seeing a blob hash, requests custody cells + 1 random extra via req-res |
-| **Provider** | (15% of network) On seeing a blob hash, requests the full payload matrix via req-res |
-| **PTC Member** | At t=8s, checks received data and broadcasts a `PayloadAttestationMessage` |
+| **Proposer** | Publishes beacon block proposals |
+| **Builder** | Releases payload envelope + blob sidecars, always requests full EL blobs |
+| **Validator** | Non-builder CL node; for each announced EL blob independently chooses sampler behavior (85%) or provider behavior (15%) |
+| **Blob Spammer** | EL-only load generator that originates blobs |
 
 ## 12-Second Slot Timeline
 
@@ -54,29 +54,33 @@ t=12s   Slot boundary → next slot
 ## Usage
 
 ```bash
-blob-sim --persona <builder|sampler|provider|ptc> \
+blob-sim --role <proposer|builder|validator|blob-spammer> \
          [--port <u16>] \
+         [--el-port <u16>] \
          [--seed <u64>] \
          [--peer <multiaddr> ...] \
+         [--el-peer <socket-addr> ...] \
          [--slots <u64>]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--persona` | *(required)* | Node role |
+| `--role` | *(required)* | Node role, repeatable |
 | `--port` | `0` (OS-assigned) | QUIC listen port |
+| `--el-port` | `0` (OS-assigned) | EL TCP listen port |
 | `--seed` | `42` | Deterministic RNG seed (keypair + random decisions) |
 | `--peer` | *(none)* | Bootstrap peer multiaddrs (repeatable) |
+| `--el-peer` | *(none)* | EL peer socket addresses (repeatable) |
 | `--slots` | `10` | Number of 12-second slots to simulate |
 
 ### Local Smoke Test
 
 ```bash
-# Terminal 1 — Builder
-cargo run -- --persona builder --port 9000 --seed 1 --slots 2
+# Terminal 1 — Proposer + builder
+cargo run -- --role proposer --role builder --port 9000 --seed 1 --slots 2
 
-# Terminal 2 — Sampler
-cargo run -- --persona sampler --port 9001 --seed 2 --slots 2 \
+# Terminal 2 — Validator
+cargo run -- --role validator --port 9001 --seed 2 --slots 2 \
   --peer /ip4/127.0.0.1/udp/9000/quic-v1
 ```
 

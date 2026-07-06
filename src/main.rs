@@ -29,8 +29,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "blob-sim", version, about)]
 struct Cli {
-    /// Node role (repeatable): proposer, builder, sampler, provider, blob-spammer.
-    /// Sampler and provider are mutually exclusive; a proposer is also a builder.
+    /// Node role (repeatable): proposer, builder, validator, blob-spammer.
+    /// Non-builder CL nodes choose sampler/provider fetch behavior per blob.
     #[arg(long = "role", required = true)]
     roles: Vec<Role>,
 

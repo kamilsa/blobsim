@@ -111,13 +111,13 @@ impl BandwidthMetrics {
         self.gossip_messages_forwarded += 1;
     }
 
-    /// Record an EL request-response request sent (Sampler/Provider → peer).
+    /// Record an EL request-response request sent (requesting peer → holder).
     pub fn record_request_sent(&mut self, bytes: usize) {
         self.el_bytes_sent += bytes as u64;
         self.el_requests_sent += 1;
     }
 
-    /// Record an EL request-response response received (peer → Sampler/Provider).
+    /// Record an EL request-response response received (holder → requesting peer).
     pub fn record_response_received(&mut self, bytes: usize) {
         self.el_bytes_received += bytes as u64;
         self.el_responses_received += 1;

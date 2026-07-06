@@ -15,11 +15,11 @@ cargo clippy -- -D warnings        # Lint (warnings are errors)
 There are no tests. The simulation itself is the validation harness — run with two terminals for a smoke test:
 
 ```bash
-# Terminal 1 — Builder
-cargo run -- --role builder --port 9000 --seed 1 --slots 2
+# Terminal 1 — Proposer + builder
+cargo run -- --role proposer --role builder --port 9000 --seed 1 --slots 2
 
-# Terminal 2 — Sampler + PTC
-cargo run -- --role sampler --role ptc --port 9001 --seed 2 --slots 2 \
+# Terminal 2 — Validator
+cargo run -- --role validator --port 9001 --seed 2 --slots 2 \
   --peer /ip4/127.0.0.1/udp/9000/quic-v1
 ```
 
@@ -58,14 +58,13 @@ The `drain_events_until()` function uses `tokio::select!` to multiplex swarm eve
 
 ### Node Roles
 
-Nodes can hold multiple roles. **Sampler and Provider are mutually exclusive** (enforced by panic in `NodeRoles::from_roles()`).
+Nodes can hold multiple roles. Sampler/provider EL fetching is not a CLI role; non-builder CL nodes choose that behavior independently per announced blob.
 
 | Role | Behaviour |
 |---|---|
 | Builder | t=0s: publish bid + blob hashes. t=4-6s: publish envelope + sidecars. Responds to data requests. |
-| Sampler | On `BlobHashAnnounce`: sends `CustodyCellRequest` (custody subset + 1 random extra) |
-| Provider | On `BlobHashAnnounce`: sends `FullPayloadRequest` |
-| PtcMember | t=8s: checks received data, publishes `PayloadAttestationMessage` |
+| Validator | On each announced blob: 85% sends `CustodyCellRequest`, 15% sends `FullPayloadRequest` |
+| BlobSpammer | EL-only load generator that originates and serves blobs |
 
 ## Key Conventions
 

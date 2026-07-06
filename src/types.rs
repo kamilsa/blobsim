@@ -21,10 +21,9 @@ pub enum Role {
     Proposer,
     /// Releases payloads + blobs at t=4-6s. Announces blob hashes at t=0.
     Builder,
-    /// EIP-8070 sampler (85% of network): requests custody cells + 1 extra.
-    Sampler,
-    /// EIP-8070 provider (15% of network): requests the full payload matrix.
-    Provider,
+    /// Non-builder CL node. For each announced blob it independently behaves as
+    /// a sampler with 85% probability or a provider with 15% probability.
+    Validator,
     /// EL-only blob load generator: originates and serves blobs at a configurable
     /// per-slot rate, paced across the slot. Holds no CL roles.
     BlobSpammer,
@@ -35,8 +34,7 @@ impl fmt::Display for Role {
         match self {
             Self::Proposer => write!(f, "proposer"),
             Self::Builder => write!(f, "builder"),
-            Self::Sampler => write!(f, "sampler"),
-            Self::Provider => write!(f, "provider"),
+            Self::Validator => write!(f, "validator"),
             Self::BlobSpammer => write!(f, "blob-spammer"),
         }
     }
@@ -48,50 +46,40 @@ impl std::str::FromStr for Role {
         match s.to_lowercase().as_str() {
             "proposer" => Ok(Self::Proposer),
             "builder" => Ok(Self::Builder),
-            "sampler" => Ok(Self::Sampler),
-            "provider" => Ok(Self::Provider),
+            "validator" => Ok(Self::Validator),
             "blob-spammer" | "blob_spammer" | "spammer" => Ok(Self::BlobSpammer),
             other => Err(format!("unknown role: {other}")),
         }
     }
 }
 
-/// Set of roles a single node holds. A node may combine roles freely except
-/// that **Sampler and Provider are mutually exclusive**.
+/// Set of roles a single node holds.
 #[derive(Debug, Clone)]
 pub struct NodeRoles {
     pub proposer: bool,
     pub builder: bool,
-    pub sampler: bool,
-    pub provider: bool,
+    pub validator: bool,
     pub blob_spammer: bool,
 }
 
 impl NodeRoles {
-    /// Build from a list of CLI-provided roles. Panics if both Sampler and
-    /// Provider are requested.
+    /// Build from a list of CLI-provided roles.
     pub fn from_roles(roles: &[Role]) -> Self {
         let mut nr = Self {
             proposer: false,
             builder: false,
-            sampler: false,
-            provider: false,
+            validator: false,
             blob_spammer: false,
         };
         for r in roles {
             match r {
                 Role::Proposer => nr.proposer = true,
                 Role::Builder => nr.builder = true,
-                Role::Sampler => nr.sampler = true,
-                Role::Provider => nr.provider = true,
+                Role::Validator => nr.validator = true,
                 Role::BlobSpammer => nr.blob_spammer = true,
             }
         }
-        assert!(
-            !(nr.sampler && nr.provider),
-            "a node cannot be both sampler and provider"
-        );
-        let has_cl = nr.proposer || nr.builder || nr.sampler || nr.provider;
+        let has_cl = nr.proposer || nr.builder || nr.validator;
         assert!(
             !(nr.blob_spammer && has_cl),
             "blob-spammer is EL-only and cannot be combined with CL roles"
@@ -104,12 +92,6 @@ impl NodeRoles {
     }
     pub fn is_builder(&self) -> bool {
         self.builder
-    }
-    pub fn is_sampler(&self) -> bool {
-        self.sampler
-    }
-    pub fn is_provider(&self) -> bool {
-        self.provider
     }
     pub fn is_blob_spammer(&self) -> bool {
         self.blob_spammer
@@ -125,11 +107,8 @@ impl fmt::Display for NodeRoles {
         if self.builder {
             parts.push("builder");
         }
-        if self.sampler {
-            parts.push("sampler");
-        }
-        if self.provider {
-            parts.push("provider");
+        if self.validator {
+            parts.push("validator");
         }
         if self.blob_spammer {
             parts.push("blob-spammer");
@@ -193,10 +172,11 @@ pub struct BlobSidecar {
 // ---------------------------------------------------------------------------
 //
 // These mirror the execution-layer blob propagation flow: the builder announces
-// blob hashes (eth/71 `NewPooledTransactionHashes` style), samplers pull custody
-// cells and providers pull the full payload, and the builder serves both. Unlike
-// the CL messages above (JSON over gossipsub), these are RLP-encoded and sent over
-// the dedicated EL TCP layer in `el_net.rs`. Byte fields use `Bytes` so RLP encodes
+// blob hashes (eth/71 `NewPooledTransactionHashes` style), non-builder CL peers
+// independently choose per blob whether to pull custody cells (sampler behavior)
+// or the full payload (provider behavior), and the holder serves both. Unlike the
+// CL messages above (JSON over gossipsub), these are RLP-encoded and sent over the
+// dedicated EL TCP layer in `el_net.rs`. Byte fields use `Bytes` so RLP encodes
 // them as byte strings (a `Vec<u8>` would RLP-encode as a list of individual bytes).
 
 /// Blob hash announcement (simulates `NewPooledTransactionHashes` in eth/71).
@@ -324,7 +304,7 @@ pub enum GossipMessage {
 /// Total number of custody columns in the simulation (simplified PeerDAS param).
 pub const NUM_CUSTODY_COLUMNS: u64 = 128;
 
-/// Number of custody columns a sampler node is assigned.
+/// Number of stable custody columns assigned to each non-builder CL node.
 pub const CUSTODY_SUBSET_SIZE: usize = 4;
 
 /// Size of a single cell (column) in bytes. PeerDAS cell = 64 field elements ×
@@ -850,6 +830,13 @@ mod tests {
     #[should_panic(expected = "EL-only")]
     fn blob_spammer_cannot_combine_with_cl_roles() {
         let _ = NodeRoles::from_roles(&[Role::BlobSpammer, Role::Builder]);
+    }
+
+    #[test]
+    fn sampler_provider_are_not_cli_roles() {
+        assert!("validator".parse::<Role>().is_ok());
+        assert!("sampler".parse::<Role>().is_err());
+        assert!("provider".parse::<Role>().is_err());
     }
 
     #[test]
