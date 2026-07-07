@@ -26,7 +26,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -43,42 +43,133 @@ const INCLUDED_WINDOW_SLOTS: u64 = 4;
 /// cells instead of the full payload.
 const SAMPLER_FETCH_PROBABILITY: f64 = 0.85;
 
-/// The local EL blobpool: full blobs this node's EL received over EL networking
-/// (announce → full-payload pulls), keyed by their announced blob hash.
+/// A pooled entry for one announced blob hash: either the full blob, or a sparse
+/// set of custody cells (column index → 2 KiB cell).
+///
+/// **Full supersedes partial**: once we hold the full blob we can derive every
+/// column's cell via [`derive_cell`], so a partial entry upgrades in place when
+/// the full blob later arrives and a full entry never downgrades.
+enum ElBlobEntry {
+    /// The full blob (128 KiB); any column's cell is derivable on demand.
+    Full(Vec<u8>),
+    /// Individually-received custody cells, keyed by column index. `BTreeMap`
+    /// keeps the column set deterministically ordered (tidy logs; free).
+    Partial(BTreeMap<u64, Cell>),
+}
+
+/// The local EL blobpool: blob data this node's EL received over EL networking,
+/// keyed by announced blob hash. Models EIP-8070's sparse blobpool — an entry is
+/// either the full blob (provider/full-payload pulls) or just the custody cells
+/// we sampled ([`ElBlobEntry`]).
 ///
 /// It has two parts:
-///   - `pending`: blobs held but not yet seen in any block. A **builder** takes
-///     up to a per-block cap from here to build a block (their hashes become the
-///     block's commitments); a **partial-column node** matches a block's
-///     commitment hashes against it (the `engine_getBlobs` analog) to derive
-///     custody cells. Bounded to [`EL_BLOB_POOL_CAPACITY`] entries, FIFO.
+///   - `pending`: entries held but not yet seen in any block. A **builder** takes
+///     up to a per-block cap of *full* blobs from here to build a block (their
+///     hashes become the block's commitments); a **partial-column node** reads it
+///     via [`get_cells`](ElBlobPool::get_cells) (the `engine_getBlobsV4` analog)
+///     to derive the custody cells it holds. Bounded to [`EL_BLOB_POOL_CAPACITY`]
+///     entries, FIFO — a partial entry counts as one slot, same as a full blob.
 ///   - `included`: hash → slot for blobs seen included in a block. Once here a
-///     blob is evicted from `pending` and refused re-entry, so it can never be
-///     re-included across slots. Pruned to the last [`INCLUDED_WINDOW_SLOTS`].
+///     blob is evicted from `pending` and refused re-entry (as full or partial),
+///     so it can never be re-included across slots. Pruned to the last
+///     [`INCLUDED_WINDOW_SLOTS`].
 ///
-/// Filled only by the EL receiving payloads over EL networking — never by a CL
-/// request.
+/// Filled only by the EL receiving payloads/cells over EL networking — never by a
+/// CL request.
 #[derive(Default)]
 struct ElBlobPool {
-    pending: std::collections::VecDeque<([u8; 32], Vec<u8>)>,
+    pending: std::collections::VecDeque<([u8; 32], ElBlobEntry)>,
     included: std::collections::HashMap<[u8; 32], u64>,
 }
 
 impl ElBlobPool {
-    fn insert(&mut self, hash: [u8; 32], blob: Vec<u8>) {
-        // Don't re-pool a blob already included in a block, or one we already hold.
-        if self.included.contains_key(&hash) || self.get(&hash).is_some() {
+    /// Locate the entry for `hash`, if pooled.
+    fn entry(&self, hash: &[u8; 32]) -> Option<&ElBlobEntry> {
+        self.pending.iter().find(|(h, _)| h == hash).map(|(_, e)| e)
+    }
+
+    fn entry_mut(&mut self, hash: &[u8; 32]) -> Option<&mut ElBlobEntry> {
+        self.pending
+            .iter_mut()
+            .find(|(h, _)| h == hash)
+            .map(|(_, e)| e)
+    }
+
+    /// Whether any data (full or partial) is pooled for `hash`.
+    fn contains(&self, hash: &[u8; 32]) -> bool {
+        self.entry(hash).is_some()
+    }
+
+    /// Pool the full blob for `hash`. Full supersedes partial: an existing partial
+    /// entry is upgraded in place (keeping its FIFO position). Refused if the hash
+    /// was already included in a block, or already held as a full blob.
+    fn insert_full(&mut self, hash: [u8; 32], blob: Vec<u8>) {
+        if self.included.contains_key(&hash) {
             return;
         }
-        self.pending.push_back((hash, blob));
-        while self.pending.len() > EL_BLOB_POOL_CAPACITY {
-            self.pending.pop_front();
+        match self.entry_mut(&hash) {
+            Some(ElBlobEntry::Full(_)) => {} // dedup: already have the full blob
+            Some(slot @ ElBlobEntry::Partial(_)) => {
+                *slot = ElBlobEntry::Full(blob); // upgrade in place; FIFO order kept
+            }
+            None => {
+                self.pending.push_back((hash, ElBlobEntry::Full(blob)));
+                while self.pending.len() > EL_BLOB_POOL_CAPACITY {
+                    self.pending.pop_front();
+                }
+            }
         }
     }
 
-    /// The pooled blob for an announced hash (the local getBlobs read).
-    fn get(&self, hash: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.pending.iter().find(|(h, _)| h == hash).map(|(_, b)| b)
+    /// Merge custody cells for `hash` into the pool. Returns how many
+    /// previously-absent cells were added (0 ⇒ no growth). Cells merge into the
+    /// existing partial entry in place (no duplicate hash, FIFO position kept). A
+    /// full entry already covers every column, so its cells are ignored. Refused
+    /// for already-included hashes.
+    fn insert_cells(&mut self, hash: [u8; 32], cells: impl IntoIterator<Item = (u64, Cell)>) -> usize {
+        if self.included.contains_key(&hash) {
+            return 0;
+        }
+        match self.entry_mut(&hash) {
+            Some(ElBlobEntry::Full(_)) => 0, // full supersedes; nothing to add
+            Some(ElBlobEntry::Partial(map)) => {
+                let mut added = 0;
+                for (col, cell) in cells {
+                    if map.insert(col, cell).is_none() {
+                        added += 1;
+                    }
+                }
+                added // in place: no push_back, FIFO order untouched
+            }
+            None => {
+                let map: BTreeMap<u64, Cell> = cells.into_iter().collect();
+                let added = map.len();
+                if added == 0 {
+                    return 0;
+                }
+                self.pending.push_back((hash, ElBlobEntry::Partial(map)));
+                while self.pending.len() > EL_BLOB_POOL_CAPACITY {
+                    self.pending.pop_front();
+                }
+                added
+            }
+        }
+    }
+
+    /// Local `engine_getBlobsV4` read: for `hash` and a set of column indices,
+    /// return one `Option<Cell>` per requested index, in order. A full entry
+    /// derives every cell; a partial entry returns the stored cell if present else
+    /// `None` (the EL lacks it); no entry ⇒ all `None`. Never a network call.
+    fn get_cells(&self, hash: &[u8; 32], columns: &[u64]) -> Vec<Option<Cell>> {
+        match self.entry(hash) {
+            Some(ElBlobEntry::Full(blob)) => {
+                columns.iter().map(|&c| Some(derive_cell(blob, c))).collect()
+            }
+            Some(ElBlobEntry::Partial(map)) => {
+                columns.iter().map(|&c| map.get(&c).cloned()).collect()
+            }
+            None => vec![None; columns.len()],
+        }
     }
 
     /// Record `hash` as included in a block at `slot`: remember it for the
@@ -88,17 +179,24 @@ impl ElBlobPool {
         self.pending.retain(|(h, _)| h != &hash);
     }
 
-    /// Take up to `max` not-yet-included pending blobs for a block at `slot`,
+    /// Take up to `max` not-yet-included *full* blobs for a block at `slot`,
     /// marking each included (so it is never re-included) and removing it from
-    /// `pending`. Any remainder stays pending for a later slot.
+    /// `pending`. Partial entries are skipped (left in place) — a builder cannot
+    /// block-include a blob it holds only cells of. Any remainder stays pending.
     fn take_pending(&mut self, max: usize, slot: u64) -> Vec<([u8; 32], Vec<u8>)> {
         let mut taken = Vec::new();
-        while taken.len() < max {
-            let Some((hash, blob)) = self.pending.pop_front() else {
-                break;
-            };
-            self.included.insert(hash, slot);
-            taken.push((hash, blob));
+        let mut i = 0;
+        while taken.len() < max && i < self.pending.len() {
+            if matches!(self.pending[i].1, ElBlobEntry::Full(_)) {
+                let (hash, entry) = self.pending.remove(i).expect("index in bounds");
+                let ElBlobEntry::Full(blob) = entry else {
+                    unreachable!("guarded by matches! above")
+                };
+                self.included.insert(hash, slot);
+                taken.push((hash, blob));
+            } else {
+                i += 1; // skip partial entry, keep scanning
+            }
         }
         taken
     }
@@ -766,6 +864,16 @@ fn handle_el_event(
                     el_blob_pool,
                 );
             }
+            if let ElMessage::CustodyResponse(resp) = &msg {
+                return handle_custody_response(
+                    from,
+                    resp,
+                    bytes,
+                    metrics,
+                    partial_state,
+                    el_blob_pool,
+                );
+            }
             serve_el_message(
                 el,
                 roles,
@@ -810,12 +918,59 @@ fn handle_full_payload(
         "EL: received full payload"
     );
     if pools_blobs {
-        el_blob_pool.insert(hash, resp.payload_data.to_vec());
+        el_blob_pool.insert_full(hash, resp.payload_data.to_vec());
         // Newly pooled blobs may let a partial-column node derive more custody
         // cells right away. (Builders consume the pool at slot start instead.)
         return !roles.is_builder() && partial_state.enabled && partial_state.get_blobs_enabled;
     }
     false
+}
+
+/// Handle received custody cells: pool them as partial blob data (for nodes on
+/// the partial-column getBlobs path) and account the bandwidth. Returns whether
+/// the pool grew — so the caller can re-derive custody columns for known blocks.
+///
+/// Mirrors [`handle_full_payload`], but stores sparse cells rather than a full
+/// blob. Builders never sample (they pull full payloads) and can't block-include
+/// partial data, so the builder branch of `pools_blobs` does not apply here.
+fn handle_custody_response(
+    from: ElPeerId,
+    resp: &CustodyCellResponse,
+    bytes: usize,
+    metrics: &mut BandwidthMetrics,
+    partial_state: &PartialState,
+    el_blob_pool: &mut ElBlobPool,
+) -> bool {
+    metrics.record_response_received(bytes);
+    if resp.blob_hash.len() != 32 {
+        warn!(from, "EL: custody cells with malformed blob hash; dropped");
+        return false;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&resp.blob_hash);
+
+    // Pool cells iff the getBlobs read path can consume them: when
+    // `get_blobs_enabled` is false, `ensure_custody_columns` skips the pool
+    // entirely, so pooled cells would be dead weight.
+    let pools_cells = partial_state.enabled && partial_state.get_blobs_enabled;
+    info!(
+        slot = resp.slot,
+        cells = resp.cells.len(),
+        from,
+        pooled = pools_cells,
+        "EL: received custody cells"
+    );
+    if !pools_cells {
+        return false;
+    }
+    let added = el_blob_pool.insert_cells(
+        hash,
+        resp.cells.iter().map(|c| (c.column, c.data.to_vec())),
+    );
+    if added > 0 {
+        metrics.record_partial_cells_pooled(added);
+    }
+    added > 0
 }
 
 /// Dispatch an inbound EL message based on type and this node's roles. Handles
@@ -861,12 +1016,17 @@ fn serve_el_message(
         ElMessage::CustodyRequest(req) => {
             metrics.record_request_received(bytes);
             info!(slot = req.slot, columns = ?req.column_indices, from, "EL: handling custody cell request");
+            // Serve deterministic cells derived from the hash-derived blob (as the
+            // full-payload server does): every holder serves identical bytes for
+            // the same (blob, column), so persisted/propagated custody cells stay
+            // byte-consistent network-wide and with full-blob-derived cells.
+            let blob = payload_for_blob_hash(&req.blob_hash);
             let cells: Vec<CustodyCell> = req
                 .column_indices
                 .iter()
                 .map(|&column| CustodyCell {
                     column,
-                    data: Bytes::from(random_bytes(rng, BYTES_PER_CELL)), // 2 KiB per cell
+                    data: Bytes::from(derive_cell(&blob, column)), // 2 KiB per cell
                 })
                 .collect();
             let response = ElMessage::CustodyResponse(CustodyCellResponse {
@@ -894,14 +1054,12 @@ fn serve_el_message(
             el.send(from, response);
         }
 
-        // -- Incoming responses (requesting side) --
+        // Custody responses are intercepted in `handle_el_event` before this
+        // dispatch (see `handle_custody_response`); this arm is unreachable.
         ElMessage::CustodyResponse(resp) => {
-            metrics.record_response_received(bytes);
-            info!(
+            debug!(
                 slot = resp.slot,
-                cells = resp.cells.len(),
-                from,
-                "EL: received custody cells"
+                from, "EL: unexpected custody response in serve path"
             );
         }
         // Full-payload responses are intercepted in `handle_el_event` before this
@@ -1062,34 +1220,41 @@ fn ensure_custody_columns(
     let num_blobs = header.kzg_commitments.len();
     let first_time = partial_state.custody_advertised_blocks.insert(block_root);
 
-    // Local getBlobs: the block's commitments embed the announced hashes of its
+    // Local getBlobsV4: the block's commitments embed the announced hashes of its
     // blobs — match each against what our EL has pooled. Blob position i in the
-    // block maps to bitmap bit i, so derived cells land at the right index.
+    // block maps to bitmap bit i. For each (blob, custody column) the pool answers
+    // with the cell if it holds it (full blob → derived; partial entry → the
+    // sampled cell) or `None` if it lacks it, which we then advertise as a request.
     let slot = slot_for_block_root(&block_root);
-    let pool_blobs: Vec<Option<Vec<u8>>> = if partial_state.get_blobs_enabled {
+    let hashes: Vec<Option<[u8; 32]>> = if partial_state.get_blobs_enabled {
         header
             .kzg_commitments
             .iter()
-            .map(|c| blob_hash_from_commitment(c).and_then(|hash| el_blob_pool.get(&hash).cloned()))
+            .map(|c| blob_hash_from_commitment(c))
             .collect()
     } else {
         vec![None; num_blobs]
     };
-    if !first_time && pool_blobs.iter().all(Option::is_none) {
+    let have_any = hashes.iter().flatten().any(|h| el_blob_pool.contains(h));
+    if !first_time && !have_any {
         return;
     }
 
     let custody = partial_state.custody_columns.clone();
     let mut pool_cells_added = 0usize;
     for &index in &custody {
-        // Partial column from the pooled blobs: bit i set iff we have blob i.
+        // Partial column from the pooled data: bit i set iff the EL can serve the
+        // cell for (blob i, this custody column).
         let mut bitmap = CellBitmap::with_len(num_blobs);
         let mut column = Vec::new();
         let mut kzg_proofs = Vec::new();
-        for (i, blob) in pool_blobs.iter().enumerate() {
-            let Some(blob) = blob else { continue };
+        for (i, h) in hashes.iter().enumerate() {
+            let Some(h) = h else { continue };
+            let Some(cell) = el_blob_pool.get_cells(h, &[index]).pop().flatten() else {
+                continue;
+            };
             bitmap.set(i);
-            column.push(derive_cell(blob, index));
+            column.push(cell);
             kzg_proofs.push(vec![0xEE; KZG_ELEMENT_SIZE]);
         }
         let partial = Arc::new(PartialDataColumn {
@@ -1238,11 +1403,21 @@ mod tests {
         x
     }
 
+    /// A 2 KiB cell filled with byte `b`, paired with its column index.
+    fn cell(col: u64, b: u8) -> (u64, Vec<u8>) {
+        (col, vec![b; BYTES_PER_CELL])
+    }
+
+    /// The FIFO order of pooled hashes' first bytes, oldest first.
+    fn order(pool: &ElBlobPool) -> Vec<u8> {
+        pool.pending.iter().map(|(hh, _)| hh[0]).collect()
+    }
+
     #[test]
     fn take_pending_caps_carries_forward_and_never_reincludes() {
         let mut pool = ElBlobPool::default();
         for i in 0..9 {
-            pool.insert(h(i), vec![i]);
+            pool.insert_full(h(i), vec![i]);
         }
         // Slot 0 includes the cap (6); the other 3 stay pending.
         let s0 = pool.take_pending(MAX_BLOBS_PER_BLOCK, 0);
@@ -1261,24 +1436,24 @@ mod tests {
     #[test]
     fn included_blob_is_refused_re_entry() {
         let mut pool = ElBlobPool::default();
-        pool.insert(h(1), vec![1]);
+        pool.insert_full(h(1), vec![1]);
         assert_eq!(pool.take_pending(MAX_BLOBS_PER_BLOCK, 0).len(), 1);
         // Re-announced after inclusion → not re-pooled, not re-included.
-        pool.insert(h(1), vec![1]);
-        assert!(pool.get(&h(1)).is_none());
+        pool.insert_full(h(1), vec![1]);
+        assert!(!pool.contains(&h(1)));
         assert!(pool.take_pending(MAX_BLOBS_PER_BLOCK, 1).is_empty());
     }
 
     #[test]
     fn mark_included_evicts_from_pending() {
         let mut pool = ElBlobPool::default();
-        pool.insert(h(2), vec![2]);
-        assert!(pool.get(&h(2)).is_some());
+        pool.insert_full(h(2), vec![2]);
+        assert!(pool.contains(&h(2)));
         pool.mark_included(h(2), 0);
-        assert!(pool.get(&h(2)).is_none());
+        assert!(!pool.contains(&h(2)));
         // And it won't be re-poolable within the window.
-        pool.insert(h(2), vec![2]);
-        assert!(pool.get(&h(2)).is_none());
+        pool.insert_full(h(2), vec![2]);
+        assert!(!pool.contains(&h(2)));
     }
 
     #[test]
@@ -1287,11 +1462,125 @@ mod tests {
         pool.mark_included(h(3), 0);
         // Still within the 4-slot window → remembered.
         pool.prune_included(INCLUDED_WINDOW_SLOTS - 1);
-        pool.insert(h(3), vec![3]);
-        assert!(pool.get(&h(3)).is_none());
+        pool.insert_full(h(3), vec![3]);
+        assert!(!pool.contains(&h(3)));
         // Window elapsed → forgotten, re-poolable.
         pool.prune_included(INCLUDED_WINDOW_SLOTS);
-        pool.insert(h(3), vec![3]);
-        assert!(pool.get(&h(3)).is_some());
+        pool.insert_full(h(3), vec![3]);
+        assert!(pool.contains(&h(3)));
+    }
+
+    // -- Partial (custody-cell) blob data --
+
+    #[test]
+    fn insert_cells_creates_partial_and_get_cells_reads_it() {
+        let mut pool = ElBlobPool::default();
+        assert_eq!(pool.insert_cells(h(1), [cell(3, 9)]), 1);
+        // Held column → the stored cell; absent column → None.
+        let got = pool.get_cells(&h(1), &[3, 7]);
+        assert_eq!(got[0].as_deref(), Some(&vec![9u8; BYTES_PER_CELL][..]));
+        assert!(got[1].is_none());
+        // No entry at all → all None.
+        assert!(pool.get_cells(&h(2), &[3]).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn insert_cells_merges_in_place_preserving_fifo() {
+        let mut pool = ElBlobPool::default();
+        pool.insert_full(h(0), vec![0]);
+        assert_eq!(pool.insert_cells(h(1), [cell(2, 1)]), 1);
+        pool.insert_full(h(2), vec![2]);
+        // A second batch for h(1) merges in place: new column counts, no dup hash,
+        // FIFO order stays [0, 1, 2].
+        assert_eq!(pool.insert_cells(h(1), [cell(5, 1)]), 1);
+        // Re-adding an already-held column adds nothing.
+        assert_eq!(pool.insert_cells(h(1), [cell(5, 9)]), 0);
+        assert_eq!(order(&pool), vec![0, 1, 2]);
+        let got = pool.get_cells(&h(1), &[2, 5]);
+        assert!(got[0].is_some() && got[1].is_some());
+    }
+
+    #[test]
+    fn insert_full_upgrades_partial_in_place() {
+        let mut pool = ElBlobPool::default();
+        pool.insert_cells(h(1), [cell(2, 1)]);
+        pool.insert_full(h(3), vec![3]);
+        let blob = vec![7u8; BLOB_SIZE];
+        pool.insert_full(h(1), blob.clone());
+        // FIFO position unchanged (h(1) still before h(3))...
+        assert_eq!(order(&pool), vec![1, 3]);
+        // ...and now every column derives from the full blob.
+        assert_eq!(
+            pool.get_cells(&h(1), &[2, 99])[0].as_deref(),
+            Some(&derive_cell(&blob, 2)[..])
+        );
+        assert!(pool.get_cells(&h(1), &[99])[0].is_some());
+    }
+
+    #[test]
+    fn insert_cells_noop_on_full() {
+        let mut pool = ElBlobPool::default();
+        let blob = vec![7u8; BLOB_SIZE];
+        pool.insert_full(h(1), blob.clone());
+        // Full already covers every column → cells add nothing.
+        assert_eq!(pool.insert_cells(h(1), [cell(2, 0xAB)]), 0);
+        // And the derived cell (not the injected 0xAB) is what we read back.
+        assert_eq!(
+            pool.get_cells(&h(1), &[2])[0].as_deref(),
+            Some(&derive_cell(&blob, 2)[..])
+        );
+    }
+
+    #[test]
+    fn take_pending_returns_full_skips_partial() {
+        let mut pool = ElBlobPool::default();
+        pool.insert_full(h(0), vec![0]);
+        pool.insert_cells(h(1), [cell(2, 1)]);
+        pool.insert_full(h(2), vec![2]);
+        // Builder takes only full blobs; the partial entry is left in place.
+        let taken: Vec<u8> = pool
+            .take_pending(MAX_BLOBS_PER_BLOCK, 0)
+            .iter()
+            .map(|(hash, _)| hash[0])
+            .collect();
+        assert_eq!(taken, vec![0, 2]);
+        assert!(pool.contains(&h(1)));
+        assert!(matches!(pool.entry(&h(1)), Some(ElBlobEntry::Partial(_))));
+    }
+
+    #[test]
+    fn included_refuses_partial_reentry() {
+        let mut pool = ElBlobPool::default();
+        pool.mark_included(h(1), 0);
+        assert_eq!(pool.insert_cells(h(1), [cell(2, 1)]), 0);
+        assert!(!pool.contains(&h(1)));
+    }
+
+    #[test]
+    fn capacity_counts_partial_entries_as_one_slot() {
+        let mut pool = ElBlobPool::default();
+        // First entry is a partial one; fill past capacity with fulls.
+        pool.insert_cells(h(0), [cell(1, 0)]);
+        for i in 1..=(EL_BLOB_POOL_CAPACITY as u8) {
+            pool.insert_full(h(i), vec![i]);
+        }
+        assert_eq!(pool.pending.len(), EL_BLOB_POOL_CAPACITY);
+        // The oldest (partial) entry was evicted like any full one.
+        assert!(!pool.contains(&h(0)));
+    }
+
+    #[test]
+    fn served_custody_cell_matches_pool_derived_cell() {
+        // The custody server serves derive_cell(payload_for_blob_hash(hash), col);
+        // a full-blob holder's get_cells derives the same bytes — so partial and
+        // full holders agree on every (blob, column) cell.
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&random_bytes(&mut StdRng::seed_from_u64(7), 32));
+        let blob = payload_for_blob_hash(&hash);
+        let served = derive_cell(&blob, 42);
+
+        let mut pool = ElBlobPool::default();
+        pool.insert_full(hash, blob.clone());
+        assert_eq!(pool.get_cells(&hash, &[42])[0].as_deref(), Some(&served[..]));
     }
 }

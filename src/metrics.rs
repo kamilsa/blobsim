@@ -37,6 +37,9 @@ pub struct BandwidthMetrics {
     partial_columns_published: u64,
     /// Columns that assembled to completion this slot.
     partial_columns_completed: u64,
+    /// Custody cells received over EL and stored as partial blob data in the
+    /// local EL blob pool (the getBlobsV4 sparse-blobpool path).
+    partial_cells_pooled: u64,
 
     // -- Cumulative totals --
     total_el_bytes_sent: u64,
@@ -68,6 +71,7 @@ impl BandwidthMetrics {
             partial_cells_received: 0,
             partial_columns_published: 0,
             partial_columns_completed: 0,
+            partial_cells_pooled: 0,
             total_el_bytes_sent: 0,
             total_el_bytes_received: 0,
             total_cl_bytes_sent: 0,
@@ -171,6 +175,12 @@ impl BandwidthMetrics {
         self.partial_columns_completed += 1;
     }
 
+    /// Record custody cells received over EL and stored as partial blob data in
+    /// the local EL blob pool.
+    pub fn record_partial_cells_pooled(&mut self, cells: usize) {
+        self.partial_cells_pooled += cells as u64;
+    }
+
     // -- Reporting --
 
     /// Emit a structured per-slot summary log line and reset slot counters.
@@ -185,7 +195,7 @@ impl BandwidthMetrics {
              gossip_sent={} gossip_received={} gossip_forwarded={} \
              partial_msgs_received={} partial_headers_received={} \
              partial_cells_received={} partial_columns_published={} \
-             partial_columns_completed={}",
+             partial_columns_completed={} partial_cells_pooled={}",
             slot,
             self.roles_label,
             self.el_bytes_sent,
@@ -206,6 +216,7 @@ impl BandwidthMetrics {
             self.partial_cells_received,
             self.partial_columns_published,
             self.partial_columns_completed,
+            self.partial_cells_pooled,
         );
 
         // Accumulate into totals
@@ -233,6 +244,7 @@ impl BandwidthMetrics {
         self.partial_cells_received = 0;
         self.partial_columns_published = 0;
         self.partial_columns_completed = 0;
+        self.partial_cells_pooled = 0;
     }
 
     /// Emit a structured end-of-simulation summary log line.
