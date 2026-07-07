@@ -246,7 +246,9 @@ def build_args(node: Node, cfg: dict, cl_peers: list[str], el_peers: list[str]) 
                   "--node-id", str(node.spammer_ordinal),
                   "--blobs-per-slot", str(int(sim["blobs_per_slot"]))]
     else:
-        parts += ["--port", str(CL_PORT), "--el-port", str(EL_PORT)]
+        parts += ["--port", str(CL_PORT), "--el-port", str(EL_PORT),
+                  "--exec-payload-size",
+                  str(int(sim.get("exec_payload_size_kib", 128)) * 1024)]
         if sim.get("enable_partial_columns"):
             parts.append("--enable-partial-columns")
         if sim.get("disable_get_blobs"):

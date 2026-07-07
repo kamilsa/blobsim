@@ -14,7 +14,7 @@ use crate::el_net::spawn_el_network;
 use crate::metrics::BandwidthMetrics;
 use crate::network::{build_swarm, dial_peers, subscribe_all};
 use crate::state_machine::{run_blob_spammer, run_node};
-use crate::types::{NodeRoles, Role, BLOBS_PER_SLOT};
+use crate::types::{NodeRoles, Role, BLOBS_PER_SLOT, EXEC_PAYLOAD_SIZE};
 
 use clap::Parser;
 use libp2p::Multiaddr;
@@ -62,6 +62,12 @@ struct Cli {
     /// paced evenly across the slot.
     #[arg(long = "blobs-per-slot", default_value_t = BLOBS_PER_SLOT)]
     blobs_per_slot: usize,
+
+    /// Size in bytes of the execution-payload body a builder reveals each slot in
+    /// its `SignedExecutionPayloadEnvelope` (the payload-reveal over CL). Only
+    /// builders publish envelopes, so this is inert for other roles.
+    #[arg(long = "exec-payload-size", default_value_t = EXEC_PAYLOAD_SIZE)]
+    exec_payload_size: usize,
 
     /// Per-node id mixed into the RNG seed so that blob-spammers launched with the
     /// same --seed still produce distinct blobs. The launcher assigns a unique value.
@@ -162,6 +168,7 @@ async fn main() {
         &mut metrics,
         cli.enable_partial_columns,
         cli.disable_get_blobs,
+        cli.exec_payload_size,
     )
     .await;
 }
