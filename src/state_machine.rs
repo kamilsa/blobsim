@@ -46,9 +46,13 @@ const SAMPLER_FETCH_PROBABILITY: f64 = 0.85;
 /// A pooled entry for one announced blob hash: either the full blob, or a sparse
 /// set of custody cells (column index → 2 KiB cell).
 ///
-/// **Full supersedes partial**: once we hold the full blob we can derive every
-/// column's cell via [`derive_cell`], so a partial entry upgrades in place when
-/// the full blob later arrives and a full entry never downgrades.
+/// The two variants are **mutually exclusive per hash**: the fetch policy makes
+/// exactly one decision per blob (sampler XOR provider, see
+/// [`send_random_sparse_blobpool_requests`]) and each hash is announced to a node
+/// once, so a blob is fetched as *either* full *or* partial data — never both.
+/// [`insert_full`](ElBlobPool::insert_full) and
+/// [`insert_cells`](ElBlobPool::insert_cells) `debug_assert!` this invariant
+/// rather than reconcile a full/partial mix that cannot arise.
 enum ElBlobEntry {
     /// The full blob (128 KiB); any column's cell is derivable on demand.
     Full(Vec<u8>),
@@ -100,9 +104,9 @@ impl ElBlobPool {
         self.entry(hash).is_some()
     }
 
-    /// Pool the full blob for `hash`. Full supersedes partial: an existing partial
-    /// entry is upgraded in place (keeping its FIFO position). Refused if the hash
-    /// was already included in a block, or already held as a full blob.
+    /// Pool the full blob for `hash`. Refused if the hash was already included in a
+    /// block, or already held as a full blob. A hash held as partial cells should
+    /// never also arrive as a full blob (see [`ElBlobEntry`]); that is asserted.
     fn insert_full(&mut self, hash: [u8; 32], blob: Vec<u8>) {
         if self.included.contains_key(&hash) {
             return;
@@ -110,7 +114,14 @@ impl ElBlobPool {
         match self.entry_mut(&hash) {
             Some(ElBlobEntry::Full(_)) => {} // dedup: already have the full blob
             Some(slot @ ElBlobEntry::Partial(_)) => {
-                *slot = ElBlobEntry::Full(blob); // upgrade in place; FIFO order kept
+                // Invariant violation: this hash was fetched as partial cells, yet
+                // a full blob arrived for it. Surfaces a broken fetch policy in
+                // debug; upgrade in place as a safe release fallback.
+                debug_assert!(
+                    false,
+                    "insert_full for a hash already held as partial cells"
+                );
+                *slot = ElBlobEntry::Full(blob);
             }
             None => {
                 self.pending.push_back((hash, ElBlobEntry::Full(blob)));
@@ -123,15 +134,29 @@ impl ElBlobPool {
 
     /// Merge custody cells for `hash` into the pool. Returns how many
     /// previously-absent cells were added (0 ⇒ no growth). Cells merge into the
-    /// existing partial entry in place (no duplicate hash, FIFO position kept). A
-    /// full entry already covers every column, so its cells are ignored. Refused
-    /// for already-included hashes.
-    fn insert_cells(&mut self, hash: [u8; 32], cells: impl IntoIterator<Item = (u64, Cell)>) -> usize {
+    /// existing partial entry in place (no duplicate hash, FIFO position kept).
+    /// Refused for already-included hashes. A hash held as a full blob should never
+    /// also arrive as custody cells (see [`ElBlobEntry`]); that is asserted.
+    fn insert_cells(
+        &mut self,
+        hash: [u8; 32],
+        cells: impl IntoIterator<Item = (u64, Cell)>,
+    ) -> usize {
         if self.included.contains_key(&hash) {
             return 0;
         }
         match self.entry_mut(&hash) {
-            Some(ElBlobEntry::Full(_)) => 0, // full supersedes; nothing to add
+            Some(ElBlobEntry::Full(_)) => {
+                // Invariant violation: this hash was fetched as a full blob, yet
+                // custody cells arrived for it. Surfaces a broken fetch policy in
+                // debug; ignore them as a safe release fallback (the full blob
+                // already covers every column).
+                debug_assert!(
+                    false,
+                    "insert_cells for a hash already held as a full blob"
+                );
+                0
+            }
             Some(ElBlobEntry::Partial(map)) => {
                 let mut added = 0;
                 for (col, cell) in cells {
@@ -162,9 +187,10 @@ impl ElBlobPool {
     /// `None` (the EL lacks it); no entry ⇒ all `None`. Never a network call.
     fn get_cells(&self, hash: &[u8; 32], columns: &[u64]) -> Vec<Option<Cell>> {
         match self.entry(hash) {
-            Some(ElBlobEntry::Full(blob)) => {
-                columns.iter().map(|&c| Some(derive_cell(blob, c))).collect()
-            }
+            Some(ElBlobEntry::Full(blob)) => columns
+                .iter()
+                .map(|&c| Some(derive_cell(blob, c)))
+                .collect(),
             Some(ElBlobEntry::Partial(map)) => {
                 columns.iter().map(|&c| map.get(&c).cloned()).collect()
             }
@@ -963,10 +989,8 @@ fn handle_custody_response(
     if !pools_cells {
         return false;
     }
-    let added = el_blob_pool.insert_cells(
-        hash,
-        resp.cells.iter().map(|c| (c.column, c.data.to_vec())),
-    );
+    let added =
+        el_blob_pool.insert_cells(hash, resp.cells.iter().map(|c| (c.column, c.data.to_vec())));
     if added > 0 {
         metrics.record_partial_cells_pooled(added);
     }
@@ -1500,35 +1524,27 @@ mod tests {
         assert!(got[0].is_some() && got[1].is_some());
     }
 
+    // A hash is fetched as either full or partial data, never both (one fetch
+    // decision per blob), so mixing the two is an asserted invariant violation.
+    // These are `#[should_panic]` and gated on `debug_assertions` (where
+    // `debug_assert!` fires); in release the fallback path is exercised instead.
+
+    #[cfg(debug_assertions)]
     #[test]
-    fn insert_full_upgrades_partial_in_place() {
+    #[should_panic(expected = "already held as partial cells")]
+    fn insert_full_over_partial_is_rejected() {
         let mut pool = ElBlobPool::default();
         pool.insert_cells(h(1), [cell(2, 1)]);
-        pool.insert_full(h(3), vec![3]);
-        let blob = vec![7u8; BLOB_SIZE];
-        pool.insert_full(h(1), blob.clone());
-        // FIFO position unchanged (h(1) still before h(3))...
-        assert_eq!(order(&pool), vec![1, 3]);
-        // ...and now every column derives from the full blob.
-        assert_eq!(
-            pool.get_cells(&h(1), &[2, 99])[0].as_deref(),
-            Some(&derive_cell(&blob, 2)[..])
-        );
-        assert!(pool.get_cells(&h(1), &[99])[0].is_some());
+        pool.insert_full(h(1), vec![7u8; BLOB_SIZE]);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn insert_cells_noop_on_full() {
+    #[should_panic(expected = "already held as a full blob")]
+    fn insert_cells_over_full_is_rejected() {
         let mut pool = ElBlobPool::default();
-        let blob = vec![7u8; BLOB_SIZE];
-        pool.insert_full(h(1), blob.clone());
-        // Full already covers every column → cells add nothing.
-        assert_eq!(pool.insert_cells(h(1), [cell(2, 0xAB)]), 0);
-        // And the derived cell (not the injected 0xAB) is what we read back.
-        assert_eq!(
-            pool.get_cells(&h(1), &[2])[0].as_deref(),
-            Some(&derive_cell(&blob, 2)[..])
-        );
+        pool.insert_full(h(1), vec![7u8; BLOB_SIZE]);
+        pool.insert_cells(h(1), [cell(2, 0xAB)]);
     }
 
     #[test]
@@ -1581,6 +1597,9 @@ mod tests {
 
         let mut pool = ElBlobPool::default();
         pool.insert_full(hash, blob.clone());
-        assert_eq!(pool.get_cells(&hash, &[42])[0].as_deref(), Some(&served[..]));
+        assert_eq!(
+            pool.get_cells(&hash, &[42])[0].as_deref(),
+            Some(&served[..])
+        );
     }
 }
