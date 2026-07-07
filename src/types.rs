@@ -213,6 +213,12 @@ pub struct CustodyCellResponse {
 }
 
 /// Provider full-payload request.
+///
+/// NOTE: the ~128 KiB single-frame response requires a Shadow build with the
+/// `tcp_sendUserData` 65535-byte send cap removed (patched `kamilsa/shadow-arm`
+/// image / shadow-arm fork). On unpatched Shadow, a partial non-blocking send
+/// happens even with buffer space free, edge-triggered epoll users (tokio) never
+/// get the promised EPOLLOUT edge, and the connection deadlocks.
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct FullPayloadRequest {
     pub slot: u64,
@@ -224,7 +230,7 @@ pub struct FullPayloadRequest {
 pub struct FullPayloadResponse {
     pub slot: u64,
     pub blob_hash: Bytes,
-    /// Dummy full blob data.
+    /// Dummy full blob data (derived from the hash — see [`payload_for_blob_hash`]).
     pub payload_data: Bytes,
 }
 
@@ -361,6 +367,19 @@ pub fn random_bytes(rng: &mut impl RngCore, n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
     rng.fill_bytes(&mut v);
     v
+}
+
+/// The full [`BLOB_SIZE`] payload for an announced blob hash, generated
+/// deterministically from the hash. Every holder serves identical bytes for the
+/// same blob, statelessly.
+pub fn payload_for_blob_hash(blob_hash: &[u8]) -> Vec<u8> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    let mut seed = [0u8; 8];
+    let n = blob_hash.len().min(8);
+    seed[..n].copy_from_slice(&blob_hash[..n]);
+    let mut rng = StdRng::seed_from_u64(u64::from_le_bytes(seed));
+    random_bytes(&mut rng, BLOB_SIZE)
 }
 
 impl BlobSidecar {

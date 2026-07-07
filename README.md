@@ -84,13 +84,110 @@ cargo run -- --role validator --port 9001 --seed 2 --slots 2 \
   --peer /ip4/127.0.0.1/udp/9000/quic-v1
 ```
 
-### Shadow
+## Running under Shadow (Docker)
 
-Compile in release mode and reference the binary in your Shadow YAML config:
+`shadow-sim.py` is a convenient [`uv`](https://docs.astral.sh/uv/) launcher that
+generates a geo-realistic network topology + a `shadow.yaml` and runs the whole
+simulation with a single command. It supports two runners (set `[run].runner` in
+`blobsim.toml`):
+
+- **`docker`** (default) — builds `blob-sim` into a Shadow-capable image and runs
+  Shadow in a container. Zero local setup beyond Docker.
+- **`native`** — builds `blob-sim` with `cargo build --release` and runs a `shadow`
+  binary from your `PATH`. Requires [Shadow](https://shadow.github.io/) installed
+  locally (Linux).
 
 ```bash
-cargo build --release
-# Binary at: target/release/blob-sim
+# Build the image (if needed) and run the sim described by blobsim.toml
+uv run shadow-sim.py
+
+# Use a different config file (positional argument, defaults to blobsim.toml)
+uv run shadow-sim.py my-config.toml
+
+# Generate shadow.yaml + topology.gml only (no Docker) — inspect before running
+uv run shadow-sim.py --dry-run
+
+# Force a rebuild of the image (after changing Rust source), and wipe old results
+uv run shadow-sim.py --rebuild --clean
+```
+
+**Requirements:** [`uv`](https://docs.astral.sh/uv/), plus — for the `docker` runner —
+Docker (arm64 / Apple Silicon); the patched Shadow base image
+(`kamilsa/shadow-arm:tcpfix`) is pulled automatically on first build. For the `native`
+runner: a local [Shadow](https://shadow.github.io/) install (equally patched — see
+below) and a Rust toolchain.
+
+> **Why patched?** Stock Shadow's `tcp_sendUserData` caps every send at 65535 bytes
+> even when the socket buffer has space, so a partial write happens on a non-full
+> buffer. Edge-triggered epoll users (tokio) then wait for an EPOLLOUT edge that never
+> fires, permanently deadlocking any connection that pushes a ≥64 KiB frame — like
+> blob-sim's 128 KiB full-payload responses. The fix (in the local shadow fork)
+> removes the cap so a short write means what POSIX implies: the buffer is full.
+
+### Configuration
+
+Everything is driven by [`blobsim.toml`](blobsim.toml) — edit it to change a run (pass a
+different file as the positional argument; the launcher itself only takes `--dry-run`,
+`--rebuild`, `--clean`). Key knobs:
+
+- `[topology]` — `validators`, `blob_spammers`, and how many CL/EL peers each node dials.
+- `[network]` — a **geo-realistic** model: each host is assigned a region and a
+  bandwidth tier by weight, and inter-host latency comes from an inter-region latency
+  matrix + per-edge jitter (ported from `lean-shadow-fuzzer`). Tune `[network.regions]`,
+  `[network.bandwidths]`, and `jitter_ratio`.
+- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `enable_partial_columns`, `rust_log`.
+
+The whole topology is deterministic in `[sim].seed`: same config → byte-identical
+`shadow.yaml`/`topology.gml`.
+
+### How it works
+
+Every node runs the single `blob-sim` binary (baked into the image at
+`/opt/blobsim/blob-sim` for the `docker` runner, or `target/release/blob-sim` for the
+`native` runner) as its own Shadow host with a distinct IP. The launcher wires
+both layers: CL peers over QUIC (`--peer`) and — unlike `run_network.sh` — **EL peers
+over TCP** (`--el-peer`, always including ≥1 blob-spammer) so blobs originate at the
+spammers and propagate through the sparse blobpool. Outputs land in `[output].dir`
+(default `shadow-output/`):
+
+```
+shadow-output/
+├── shadow.yaml        # generated Shadow config
+├── topology.gml       # generated geo network graph
+├── regions.json       # per-host region assignment (debug)
+├── bandwidths.json    # per-host bandwidth tier (debug)
+└── shadow.data/hosts/<host>/blob-sim.1000.stdout   # per-node logs
+```
+
+### Analysis
+
+After each run the launcher prints a **summary** — blocks produced, per-slot block /
+payload-envelope propagation reach, blob commitments, and EL/CL traffic totals — so you
+can see at a glance whether a run actually exercised the network (and it flags common
+issues like blocks that committed zero blobs). Re-print it for an existing run without
+re-simulating:
+
+```bash
+uv run shadow-sim.py --summary-only
+```
+
+For interactive per-node bandwidth charts:
+
+```bash
+cd shadow-output && python ../create_notebook.py   # → Analysis.ipynb
+```
+
+> Note: `create_notebook.py`'s per-node example cells reference host names from the old
+> role model (`plot_per_second("builder")`, `"sampler4"`, `"provider1"`). Point them at
+> the current host names instead (`"proposer"`, `"validator000"`, …); the aggregate
+> charts key off `roles=` in the logs and work unchanged.
+
+### Building the binary directly
+
+If you just want the release binary (e.g. to reference from your own Shadow config):
+
+```bash
+cargo build --release   # → target/release/blob-sim
 ```
 
 ## Design Constraints

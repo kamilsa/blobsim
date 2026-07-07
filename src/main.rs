@@ -86,7 +86,12 @@ struct Cli {
     disable_get_blobs: bool,
 }
 
-#[tokio::main]
+// A single-threaded (current-thread) runtime: under Shadow every guest thread is
+// simulated on a deterministic scheduler, so tokio's multi-threaded work-stealing
+// runtime only adds simulated context-switch overhead and scheduling noise without
+// any parallelism benefit. One cooperatively-polled thread keeps runs lean and
+// closer to deterministic.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Initialize tracing (controlled by RUST_LOG env var, default = info).
     tracing_subscriber::fmt()

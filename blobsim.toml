@@ -1,0 +1,60 @@
+# blobsim.toml — configuration for `uv run shadow-sim.py`.
+#
+# Describes a single Shadow simulation: how many nodes of each role, how they are
+# wired over CL (QUIC) and EL (TCP), and a geo-realistic network (per-host region +
+# bandwidth, inter-region latency matrix + jitter). Edit this file to change a run;
+# the launcher takes only operational flags (config path, --dry-run, --rebuild, --clean).
+
+[run]
+# "docker" builds an image (blob-sim on top of [docker].shadow_image) and runs Shadow
+#          in a container — zero local setup beyond Docker.
+# "native" builds blob-sim with `cargo build --release` and runs a `shadow` binary
+#          found on PATH — requires Shadow installed locally (Linux).
+runner = "docker"
+
+[sim]
+slots = 10                   # number of 12-second slots to simulate
+seed = 42                    # master RNG seed (topology + per-node keypairs)
+blobs_per_slot = 6           # blobs each blob-spammer originates per slot (spam rate)
+enable_partial_columns = false   # gossipsub 1.3 partial messages / data-column sidecars
+disable_get_blobs = false        # only meaningful with enable_partial_columns
+rust_log = "info"            # per-node RUST_LOG; set "debug" for per-second metrics
+# stop_time = "130s"         # optional; default = slots*12s + 10s margin
+
+[topology]
+validators = 100             # non-builder CL nodes (choose sampler/provider per blob)
+blob_spammers = 4            # EL-only load generators that originate blobs
+peers_per_node = 3           # random CL (QUIC) peers each CL node dials (incl. proposer)
+el_peers_per_node = 3        # random EL (TCP) peers each node dials (incl. >=1 spammer)
+
+# Geo-realistic network. Each host is assigned a region and a bandwidth tier by
+# weight; inter-host latency comes from a fixed inter-region matrix + per-edge jitter.
+[network]
+jitter_ratio = 0.3           # +/- fraction applied per edge to the base geo latency
+packet_loss = 0.0            # per-link packet loss (0.0 - 1.0)
+
+[network.regions]            # region -> weight (probability a host lands there)
+us-east = 0.30
+us-west = 0.15
+europe  = 0.25
+asia    = 0.20
+sa      = 0.05
+africa  = 0.05
+
+[network.bandwidths]         # bandwidth tier -> weight (applied to up and down)
+"1 Gbit"   = 0.05
+"100 Mbit" = 0.20
+"50 Mbit"  = 0.75
+
+[docker]
+# Base image that ships Shadow (arm64). Must be a build with the tcp_sendUserData
+# 65535-byte send cap removed (patched shadow-arm fork, commit ae04b0890) —
+# blob-sim's 128 KiB EL frames deadlock on stock Shadow. The :tcpfix tag on Docker
+# Hub carries that fix (pulled automatically); to build it yourself:
+#   docker build -t kamilsa/shadow-arm:tcpfix ~/dev/shadow
+shadow_image = "kamilsa/shadow-arm:tcpfix"
+image_name = "blobsim-shadow:local"   # image built from docker/Dockerfile
+rebuild = false                       # force `docker build` before running
+
+[output]
+dir = "shadow-output"        # where shadow.yaml, topology.gml and shadow.data/ go
