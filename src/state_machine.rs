@@ -286,6 +286,7 @@ pub async fn run_node(
     metrics: &mut BandwidthMetrics,
     enable_partial_columns: bool,
     disable_get_blobs: bool,
+    exec_payload_size: usize,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -376,7 +377,8 @@ pub async fn run_node(
         if roles.is_builder() {
             // Publish the payload-reveal envelope. Blob commitments were already
             // announced in the t=0 proposal, so the envelope doesn't repeat them.
-            let envelope = SignedExecutionPayloadEnvelope::new(slot, node_index);
+            let envelope =
+                SignedExecutionPayloadEnvelope::new(slot, node_index, exec_payload_size);
             publish_gossip(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,
@@ -386,6 +388,7 @@ pub async fn run_node(
             info!(
                 slot,
                 blobs = block_blobs.len(),
+                payload_bytes = exec_payload_size,
                 "builder: published payload envelope"
             );
 
@@ -830,6 +833,7 @@ fn handle_gossip_message(msg: GossipMessage) {
             info!(
                 slot = env.slot,
                 builder = env.builder_index,
+                payload_bytes = env.payload.len(),
                 "received payload envelope"
             );
         }

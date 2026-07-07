@@ -135,7 +135,7 @@ different file as the positional argument; the launcher itself only takes `--dry
   bandwidth tier by weight, and inter-host latency comes from an inter-region latency
   matrix + per-edge jitter (ported from `lean-shadow-fuzzer`). Tune `[network.regions]`,
   `[network.bandwidths]`, and `jitter_ratio`.
-- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `enable_partial_columns`, `rust_log`.
+- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`, `enable_partial_columns`, `rust_log`.
 
 The whole topology is deterministic in `[sim].seed`: same config → byte-identical
 `shadow.yaml`/`topology.gml`.

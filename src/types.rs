@@ -152,6 +152,10 @@ pub struct SignedExecutionPayloadEnvelope {
     pub state_root: [u8; 32],
     /// Dummy BLS signature (96 bytes).
     pub builder_signature: Vec<u8>,
+    /// Execution-block body (dummy bytes). Only its length is meaningful — it
+    /// models the on-wire cost of revealing the execution payload. Sized by
+    /// `[sim].exec_payload_size_kib` (default [`EXEC_PAYLOAD_SIZE`]).
+    pub payload: Vec<u8>,
 }
 
 /// A single blob sidecar accompanying the payload envelope.
@@ -327,6 +331,11 @@ pub const BLOB_SIZE: usize = BYTES_PER_CELL * CELLS_PER_BLOB;
 /// Default number of blobs a blob-spammer originates per slot (its spam rate).
 pub const BLOBS_PER_SLOT: usize = 6;
 
+/// Default size (bytes) of the execution-payload body carried in the
+/// [`SignedExecutionPayloadEnvelope`] a builder reveals each slot. 128 KiB is a
+/// realistic mainnet execution-block body; tune via `[sim].exec_payload_size_kib`.
+pub const EXEC_PAYLOAD_SIZE: usize = 128 * 1024;
+
 /// Maximum blobs a builder includes in one block. Blobs beyond this stay pooled
 /// for a later slot; the cap is what makes cross-slot inclusion tracking matter.
 pub const MAX_BLOBS_PER_BLOCK: usize = 6;
@@ -349,14 +358,15 @@ impl SignedBeaconBlock {
 }
 
 impl SignedExecutionPayloadEnvelope {
-    /// The payload-reveal envelope for a slot's block. Blob commitments live in
-    /// the t=0 proposal, not here.
-    pub fn new(slot: u64, builder_index: u64) -> Self {
+    /// The payload-reveal envelope for a slot's block, carrying a `payload_size`-byte
+    /// execution-block body. Blob commitments live in the t=0 proposal, not here.
+    pub fn new(slot: u64, builder_index: u64, payload_size: usize) -> Self {
         Self {
             slot,
             builder_index,
             state_root: [0xBB; 32],
             builder_signature: vec![0xDD; 96],
+            payload: vec![0xEE; payload_size],
         }
     }
 }
