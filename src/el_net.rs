@@ -7,16 +7,21 @@
 //! (`[u32 big-endian length | msg_id byte | rlp(body)]`), without RLPx encryption or
 //! discovery (out of scope for a dummy-crypto simulator).
 //!
-//! A single background actor owns the listener and every peer connection. It talks
-//! to the state machine over channels: the state machine issues [`ElCommand`]s and
-//! receives [`ElEvent`]s. All bandwidth accounting stays in the (single-threaded)
-//! state machine — events carry encoded byte sizes — so determinism under Shadow is
-//! preserved.
+//! A single background actor owns the listener and connection bookkeeping, but each
+//! peer connection gets its **own** reader and writer task. The actor never blocks on
+//! a socket: to send, it hands an encoded frame to the target peer's writer task over
+//! an unbounded channel, so a slow/backpressured peer only backs up its own queue and
+//! never stalls the actor's read path or other peers' writes (avoiding head-of-line
+//! blocking that otherwise collapses throughput at scale). The state machine issues
+//! [`ElCommand`]s and receives [`ElEvent`]s. All bandwidth accounting stays in the
+//! (single-threaded) state machine — events carry encoded byte sizes — so determinism
+//! under Shadow is preserved.
 
 use crate::types::{BlobHashAnnounce, ElMessage};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -26,6 +31,12 @@ use tracing::{debug, info, warn};
 
 /// Identifies a single EL peer connection (assigned in connection order).
 pub type ElPeerId = usize;
+
+// NOTE: frames larger than 64 KiB require a Shadow build with the
+// `tcp_sendUserData` 65535-byte send cap removed (the patched shadow-arm fork /
+// kamilsa/shadow-arm image). On unpatched Shadow, sendto() returns a partial
+// write even with buffer space free, and edge-triggered epoll (tokio) then waits
+// forever for an EPOLLOUT edge that never fires — deadlocking the connection.
 
 /// Outbound instruction from the state machine to the EL network actor.
 enum ElCommand {
@@ -124,11 +135,15 @@ async fn run_actor(
         });
     }
 
-    // Channel carrying inbound frames / closes from per-connection reader tasks.
+    // Channel carrying inbound frames / closes from per-connection reader/writer tasks.
     let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMsg>();
 
-    let mut writers: HashMap<ElPeerId, OwnedWriteHalf> = HashMap::new();
+    // Each peer maps to the sender half of its writer task's queue. Sending is
+    // non-blocking: the frame is queued and the writer task drains it independently,
+    // so one slow peer can never block the actor or other peers.
+    let mut writers: HashMap<ElPeerId, mpsc::UnboundedSender<Arc<Vec<u8>>>> = HashMap::new();
     let mut next_id: ElPeerId = 0;
+    let mut frames_delivered: u64 = 0; // DIAG: messages handed to the state machine
 
     loop {
         tokio::select! {
@@ -136,19 +151,15 @@ async fn run_actor(
                 // Handle dropped (state machine finished) → shut the actor down.
                 None => break,
                 Some(ElCommand::Broadcast(msg)) => {
-                    let payload = msg.encode();
-                    for w in writers.values_mut() {
-                        if let Err(e) = write_frame(w, &payload).await {
-                            debug!(error = %e, "EL: broadcast write failed");
-                        }
+                    // Encode once and hand a shared copy to every peer's writer task.
+                    let payload = Arc::new(msg.encode());
+                    for tx in writers.values() {
+                        let _ = tx.send(payload.clone());
                     }
                 }
                 Some(ElCommand::Send { peer, msg }) => {
-                    if let Some(w) = writers.get_mut(&peer) {
-                        let payload = msg.encode();
-                        if let Err(e) = write_frame(w, &payload).await {
-                            debug!(peer, error = %e, "EL: send write failed");
-                        }
+                    if let Some(tx) = writers.get(&peer) {
+                        let _ = tx.send(Arc::new(msg.encode()));
                     } else {
                         warn!(peer, "EL: send to unknown peer");
                     }
@@ -174,28 +185,34 @@ async fn run_actor(
                     let bytes = payload.len() + 4;
                     match ElMessage::decode(&payload) {
                         Ok(msg) => {
+                            frames_delivered += 1;
                             let _ = event_tx.send(ElEvent::Message { from: peer, msg, bytes });
                         }
                         Err(e) => warn!(peer, error = ?e, "EL: failed to decode frame"),
                     }
                 }
                 Some(ReaderMsg::Closed { peer }) => {
-                    writers.remove(&peer);
-                    let _ = event_tx.send(ElEvent::PeerDisconnected(peer));
+                    // Either the reader or the writer task may report a close; only
+                    // emit the disconnect once (when the writer is still present).
+                    if writers.remove(&peer).is_some() {
+                        let _ = event_tx.send(ElEvent::PeerDisconnected(peer));
+                    }
                 }
                 None => {}
             },
         }
     }
 
-    info!("EL: actor shutting down");
+    info!(frames_delivered, "EL: actor shutting down");
 }
 
-/// Split a stream, store its write half, spawn its reader, and announce the peer.
+/// Split a stream, spawn its reader + writer tasks, and announce the peer. The
+/// returned writer-queue sender is stored so the actor can enqueue frames without
+/// ever awaiting a socket write itself.
 fn register_connection(
     stream: TcpStream,
     next_id: &mut ElPeerId,
-    writers: &mut HashMap<ElPeerId, OwnedWriteHalf>,
+    writers: &mut HashMap<ElPeerId, mpsc::UnboundedSender<Arc<Vec<u8>>>>,
     reader_tx: &mpsc::UnboundedSender<ReaderMsg>,
     event_tx: &mpsc::UnboundedSender<ElEvent>,
 ) {
@@ -204,9 +221,31 @@ fn register_connection(
     *next_id += 1;
 
     let (read_half, write_half) = stream.into_split();
-    writers.insert(id, write_half);
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<Arc<Vec<u8>>>();
+    writers.insert(id, write_tx);
+    spawn_writer(id, write_half, write_rx, reader_tx.clone());
     spawn_reader(id, read_half, reader_tx.clone());
     let _ = event_tx.send(ElEvent::PeerConnected(id));
+}
+
+/// Per-connection writer: drains this peer's frame queue and writes each frame to the
+/// socket. Runs independently of the actor, so a backpressured socket only stalls this
+/// one peer. On write failure it reports the peer closed and exits.
+fn spawn_writer(
+    peer: ElPeerId,
+    mut write_half: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<Arc<Vec<u8>>>,
+    closed_tx: mpsc::UnboundedSender<ReaderMsg>,
+) {
+    tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            if let Err(e) = write_frame(&mut write_half, &payload).await {
+                debug!(peer, error = %e, "EL: write failed");
+                let _ = closed_tx.send(ReaderMsg::Closed { peer });
+                break;
+            }
+        }
+    });
 }
 
 /// Per-connection reader: decode frames off the wire and forward them to the actor.

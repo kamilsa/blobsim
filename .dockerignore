@@ -1,0 +1,9 @@
+# Keep the build context small — target/ alone is hundreds of MB and is rebuilt
+# inside the image anyway.
+target/
+logs/
+shadow-output/
+.git/
+.idea/
+.github/
+*.ipynb

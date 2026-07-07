@@ -755,34 +755,16 @@ fn handle_el_event(
             false
         }
         ElEvent::Message { from, msg, bytes } => {
-            let pools_blobs =
-                roles.is_builder() || (partial_state.enabled && partial_state.get_blobs_enabled);
-            if pools_blobs {
-                if let ElMessage::FullPayloadResponse(resp) = &msg {
-                    metrics.record_response_received(bytes);
-                    info!(
-                        slot = resp.slot,
-                        payload_size = resp.payload_data.len(),
-                        from,
-                        "EL: received full payload (added to local blob pool)"
-                    );
-                    if resp.blob_hash.len() == 32 {
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&resp.blob_hash);
-                        el_blob_pool.insert(hash, resp.payload_data.to_vec());
-                    } else {
-                        warn!(
-                            from,
-                            "EL: full payload with malformed blob hash; not pooled"
-                        );
-                    }
-                    // Newly pooled blobs may let a partial-column node derive
-                    // more custody cells right away. (Builders consume the pool
-                    // at slot start instead.)
-                    return !roles.is_builder()
-                        && partial_state.enabled
-                        && partial_state.get_blobs_enabled;
-                }
+            if let ElMessage::FullPayloadResponse(resp) = &msg {
+                return handle_full_payload(
+                    roles,
+                    from,
+                    resp,
+                    bytes,
+                    metrics,
+                    partial_state,
+                    el_blob_pool,
+                );
             }
             serve_el_message(
                 el,
@@ -797,6 +779,43 @@ fn handle_el_event(
             false
         }
     }
+}
+
+/// Handle a received full payload: pool it (for nodes that pool blobs) and
+/// account the bandwidth. Returns whether the blob pool grew.
+fn handle_full_payload(
+    roles: &NodeRoles,
+    from: ElPeerId,
+    resp: &FullPayloadResponse,
+    bytes: usize,
+    metrics: &mut BandwidthMetrics,
+    partial_state: &PartialState,
+    el_blob_pool: &mut ElBlobPool,
+) -> bool {
+    metrics.record_response_received(bytes);
+    if resp.blob_hash.len() != 32 {
+        warn!(from, "EL: full payload with malformed blob hash; dropped");
+        return false;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&resp.blob_hash);
+
+    let pools_blobs =
+        roles.is_builder() || (partial_state.enabled && partial_state.get_blobs_enabled);
+    info!(
+        slot = resp.slot,
+        payload_size = resp.payload_data.len(),
+        from,
+        pooled = pools_blobs,
+        "EL: received full payload"
+    );
+    if pools_blobs {
+        el_blob_pool.insert(hash, resp.payload_data.to_vec());
+        // Newly pooled blobs may let a partial-column node derive more custody
+        // cells right away. (Builders consume the pool at slot start instead.)
+        return !roles.is_builder() && partial_state.enabled && partial_state.get_blobs_enabled;
+    }
+    false
 }
 
 /// Dispatch an inbound EL message based on type and this node's roles. Handles
@@ -863,10 +882,12 @@ fn serve_el_message(
         ElMessage::FullPayloadRequest(req) => {
             metrics.record_request_received(bytes);
             info!(slot = req.slot, from, "EL: handling full payload request");
+            // Serve the hash-derived payload: every holder serves identical
+            // bytes for the same blob, deterministically.
             let response = ElMessage::FullPayloadResponse(FullPayloadResponse {
                 slot: req.slot,
-                blob_hash: req.blob_hash,
-                payload_data: Bytes::from(random_bytes(rng, BLOB_SIZE)),
+                blob_hash: req.blob_hash.clone(),
+                payload_data: Bytes::from(payload_for_blob_hash(&req.blob_hash)),
             });
             let resp_bytes = response.encode().len() + 4;
             metrics.record_response_sent(resp_bytes);
@@ -883,13 +904,12 @@ fn serve_el_message(
                 "EL: received custody cells"
             );
         }
+        // Full-payload responses are intercepted in `handle_el_event` before this
+        // dispatch (see `handle_full_payload`); this arm is unreachable.
         ElMessage::FullPayloadResponse(resp) => {
-            metrics.record_response_received(bytes);
-            info!(
+            debug!(
                 slot = resp.slot,
-                payload_size = resp.payload_data.len(),
-                from,
-                "EL: received full payload"
+                from, "EL: unexpected full payload in serve path"
             );
         }
     }
