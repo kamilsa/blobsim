@@ -301,17 +301,22 @@ pub async fn run_node(
         // Forget inclusions older than the eviction window.
         el_blob_pool.prune_included(slot);
 
-        // Blocks-in-blobs (EIP-8142): the builder knows the execution payload at
-        // slot start, so it encodes it into `n_payload` payload-blobs whose
-        // commitments come *first* in the block. These share the per-block blob
-        // budget with EL blobs and are generated locally by the builder — they are
-        // never announced/propagated over EL, so no other node holds them in its EL
-        // pool (this is what disables the cell-level delta optimization for them).
-        let n_payload = if blocks_in_blobs && roles.is_builder() {
-            payload_blob_count(exec_payload_size)
+        // The builder samples one random execution payload per slot. When
+        // blocks-in-blobs is enabled, the same bytes are also encoded into
+        // payload-blobs whose commitments come first in the block. These blobs are
+        // generated locally by the builder and never announced over EL, so peers
+        // cannot pre-fill their cells from the EL blob pool.
+        let execution_payload = if roles.is_builder() {
+            random_bytes(&mut rng, exec_payload_size)
         } else {
-            0
+            Vec::new()
         };
+        let payload_blobs = if blocks_in_blobs && roles.is_builder() {
+            encode_payload_blobs(&execution_payload, &mut rng)
+        } else {
+            Vec::new()
+        };
+        let n_payload = payload_blobs.len();
 
         // Builder: select up to the remaining budget of not-yet-included blobs from
         // its EL pool to include in this slot's block; `take_pending` marks them
@@ -323,22 +328,21 @@ pub async fn run_node(
             Vec::new()
         };
 
-        // Payload-blobs prepended so their commitments occupy the first
-        // `n_payload` slots of `blob_kzg_commitments` (EIP-8142). Each is a full
-        // BLOB_SIZE blob of builder-originated data under a fresh random hash that
-        // no peer has seen over EL.
+        // Payload-blobs are prepended so their commitments occupy the first
+        // `n_payload` slots of `blob_kzg_commitments` (EIP-8142). Each uses a fresh
+        // random hash that no peer has seen over EL.
         let mut block_blobs: Vec<([u8; 32], Vec<u8>)> =
             Vec::with_capacity(n_payload + el_blobs.len());
-        for _ in 0..n_payload {
+        for blob in payload_blobs {
             let hash: [u8; 32] = random_bytes(&mut rng, 32)
                 .try_into()
                 .expect("32 random bytes");
-            block_blobs.push((hash, random_bytes(&mut rng, BLOB_SIZE)));
+            block_blobs.push((hash, blob));
         }
         block_blobs.extend(el_blobs);
 
-        // Commitments naming exactly the pooled blobs (embed their announced EL
-        // hashes), shared by the t=0 proposal and the t=4-6 payload reveal.
+        // Commitments naming exactly the block blobs, shared by the t=0 proposal
+        // and the t=4-6 payload reveal.
         let commitments: Vec<Vec<u8>> = block_blobs
             .iter()
             .map(|(hash, _)| commitment_for_blob_hash(hash))
@@ -347,9 +351,10 @@ pub async fn run_node(
         // ---------------------------------------------------------------
         // t=0s — Proposal phase (proposer == builder in this model)
         //
-        // The proposal commits to the blobs the builder received over EL
-        // networking. Validators that already hold those blobs (matched by hash
-        // against their own EL pool) start propagating columns on seeing it.
+        // The proposal commits to the block's blobs. Validators that already hold
+        // EL-propagated blobs (matched by hash against their own EL pool) start
+        // propagating those columns on seeing it; builder-local payload-blobs have
+        // no matching EL pool entries.
         // ---------------------------------------------------------------
         if roles.is_proposer() {
             let block = SignedBeaconBlock::with_commitments(slot, node_index, commitments.clone());
@@ -395,7 +400,8 @@ pub async fn run_node(
             // Under blocks-in-blobs the payload *also* rides the column subnets as
             // payload-blobs (below); the two paths coexist, and only zk-attesters
             // (unsubscribed from this topic) rely solely on the column path.
-            let envelope = SignedExecutionPayloadEnvelope::new(slot, node_index, exec_payload_size);
+            let envelope =
+                SignedExecutionPayloadEnvelope::new(slot, node_index, execution_payload.clone());
             publish_gossip(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,
@@ -406,7 +412,7 @@ pub async fn run_node(
                 slot,
                 blobs = block_blobs.len(),
                 payload_blobs = n_payload,
-                payload_bytes = exec_payload_size,
+                payload_bytes = execution_payload.len(),
                 "builder: published payload envelope"
             );
 

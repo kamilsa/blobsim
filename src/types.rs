@@ -388,6 +388,22 @@ pub fn payload_blob_count(exec_payload_size: usize) -> usize {
     exec_payload_size.div_ceil(USABLE_BYTES_PER_BLOB)
 }
 
+/// Encode an execution payload into full blob bodies for blocks-in-blobs.
+///
+/// The first [`USABLE_BYTES_PER_BLOB`] bytes of each blob carry payload bytes;
+/// all remaining bytes are seeded random padding so compression-sensitive runs do
+/// not see unrealistic zero/repeated-byte bodies.
+pub fn encode_payload_blobs(payload: &[u8], rng: &mut impl RngCore) -> Vec<Vec<u8>> {
+    payload
+        .chunks(USABLE_BYTES_PER_BLOB)
+        .map(|chunk| {
+            let mut blob = random_bytes(rng, BLOB_SIZE);
+            blob[..chunk.len()].copy_from_slice(chunk);
+            blob
+        })
+        .collect()
+}
+
 impl SignedBeaconBlock {
     /// A proposal committing to the given (hash-bearing) blob KZG commitments —
     /// built by the proposer from the blobs it pooled over EL networking.
@@ -406,15 +422,16 @@ impl SignedBeaconBlock {
 }
 
 impl SignedExecutionPayloadEnvelope {
-    /// The payload-reveal envelope for a slot's block, carrying a `payload_size`-byte
-    /// execution-block body. Blob commitments live in the t=0 proposal, not here.
-    pub fn new(slot: u64, builder_index: u64, payload_size: usize) -> Self {
+    /// The payload-reveal envelope for a slot's block, carrying the exact
+    /// execution-block body bytes. Blob commitments live in the t=0 proposal, not
+    /// here.
+    pub fn new(slot: u64, builder_index: u64, payload: Vec<u8>) -> Self {
         Self {
             slot,
             builder_index,
             state_root: [0xBB; 32],
             builder_signature: vec![0xDD; 96],
-            payload: vec![0xEE; payload_size],
+            payload,
         }
     }
 }
@@ -507,8 +524,8 @@ pub fn block_root_for_slot(slot: u64) -> [u8; 32] {
     root[..8].copy_from_slice(&slot.to_le_bytes());
     // Spread the slot across the root so distinct slots stay visually distinct
     // in logs; the exact transform is irrelevant (dummy crypto).
-    for i in 8..32 {
-        root[i] = (slot as u8).wrapping_mul(31).wrapping_add(i as u8);
+    for (i, byte) in root.iter_mut().enumerate().skip(8) {
+        *byte = (slot as u8).wrapping_mul(31).wrapping_add(i as u8);
     }
     root
 }
@@ -901,6 +918,47 @@ mod tests {
         let x = BlobSidecar::random(0, 0, &mut rng);
         let y = BlobSidecar::random(0, 1, &mut rng);
         assert_ne!(x.blob_data, y.blob_data);
+    }
+
+    #[test]
+    fn execution_payload_envelope_keeps_supplied_random_payload() {
+        let payload = random_bytes(&mut StdRng::seed_from_u64(321), 4096);
+        let envelope = SignedExecutionPayloadEnvelope::new(4, 9, payload.clone());
+
+        assert_eq!(envelope.payload, payload);
+        assert!(envelope.payload.windows(2).any(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn payload_blob_encoding_round_trips_payload_with_random_padding() {
+        let payload_len = USABLE_BYTES_PER_BLOB + 123;
+        let payload = random_bytes(&mut StdRng::seed_from_u64(11), payload_len);
+
+        let mut rng = StdRng::seed_from_u64(22);
+        let blobs = encode_payload_blobs(&payload, &mut rng);
+
+        assert_eq!(blobs.len(), payload_blob_count(payload.len()));
+        assert!(blobs.iter().all(|blob| blob.len() == BLOB_SIZE));
+
+        let recovered: Vec<u8> = blobs
+            .iter()
+            .flat_map(|blob| blob[..USABLE_BYTES_PER_BLOB].iter().copied())
+            .take(payload.len())
+            .collect();
+        assert_eq!(recovered, payload);
+
+        // Same payload + seed gives reproducible blob bodies, including padding.
+        let mut same_rng = StdRng::seed_from_u64(22);
+        assert_eq!(blobs, encode_payload_blobs(&payload, &mut same_rng));
+
+        // The last blob's unused bytes are random-looking padding, not zeros or a
+        // repeated dummy byte that would compress unrealistically well.
+        let last_chunk_len = payload_len - USABLE_BYTES_PER_BLOB;
+        let padding = &blobs[1][last_chunk_len..];
+        assert!(padding.windows(2).any(|w| w[0] != w[1]));
+
+        let mut empty_rng = StdRng::seed_from_u64(1);
+        assert!(encode_payload_blobs(&[], &mut empty_rng).is_empty());
     }
 
     #[test]
