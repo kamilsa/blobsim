@@ -250,11 +250,11 @@ struct PartialState {
 }
 
 impl PartialState {
-    fn new(enabled: bool, get_blobs_enabled: bool, seed: u64) -> Self {
+    fn new(enabled: bool, get_blobs_enabled: bool, seed: u64, custody_columns: usize) -> Self {
         Self {
             enabled,
             get_blobs_enabled,
-            custody_columns: custody_columns_for_seed(seed),
+            custody_columns: custody_columns_for_seed(seed, custody_columns),
             assembler: PartialColumnAssembler::new(ASSEMBLER_CAPACITY),
             header_tracker: PartialColumnHeaderTracker::new(HEADER_TRACKER_CAPACITY),
             custody_advertised_blocks: HashSet::new(),
@@ -275,6 +275,7 @@ pub async fn run_node(
     disable_get_blobs: bool,
     exec_payload_size: usize,
     blocks_in_blobs: bool,
+    custody_columns: usize,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -285,7 +286,8 @@ pub async fn run_node(
 
     // Partial data-column state (gossipsub 1.3 cell-level deltas). Inert unless
     // `--enable-partial-columns` is set.
-    let mut partial_state = PartialState::new(enable_partial_columns, !disable_get_blobs, seed);
+    let mut partial_state =
+        PartialState::new(enable_partial_columns, !disable_get_blobs, seed, custody_columns);
 
     // Full blobs this node's EL receives over EL networking. Builders drain it
     // to assemble a block's blob set; partial-column nodes read it via the
@@ -545,7 +547,7 @@ pub async fn run_blob_spammer(
     let mut el_peer_count: usize = 0;
     // Blob-spammers are EL-only: partial columns are disabled and they are not
     // builders, so the shared EL handler never pools blobs for them.
-    let partial_state = PartialState::new(false, true, seed);
+    let partial_state = PartialState::new(false, true, seed, CUSTODY_SUBSET_SIZE);
     let mut el_blob_pool = ElBlobPool::default();
 
     info!(%roles, num_slots, blobs_per_slot, node_id, "starting blob-spammer");

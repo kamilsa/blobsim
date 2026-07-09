@@ -336,16 +336,19 @@ pub enum GossipMessage {
 /// Total number of custody columns in the simulation (simplified PeerDAS param).
 pub const NUM_CUSTODY_COLUMNS: u64 = 128;
 
-/// Number of stable custody columns assigned to each non-builder CL node.
-pub const CUSTODY_SUBSET_SIZE: usize = 4;
+/// Default number of stable custody columns assigned to each non-builder CL node
+/// (overridable via `--custody-columns`).
+pub const CUSTODY_SUBSET_SIZE: usize = 8;
 
-/// Deterministically pick a node's [`CUSTODY_SUBSET_SIZE`] custody columns from its
-/// seed. A CL client subscribes only to these columns' subnets and only fetches
-/// their cells (a supernode — deferred — would custody all [`NUM_CUSTODY_COLUMNS`]).
-pub fn custody_columns_for_seed(seed: u64) -> Vec<u64> {
+/// Deterministically pick a node's `subset_size` custody columns from its seed. A
+/// CL client subscribes only to these columns' subnets and only fetches their
+/// cells (a supernode — deferred — would custody all [`NUM_CUSTODY_COLUMNS`]).
+/// `subset_size` is clamped to [`NUM_CUSTODY_COLUMNS`] to keep the loop bounded.
+pub fn custody_columns_for_seed(seed: u64, subset_size: usize) -> Vec<u64> {
+    let subset_size = subset_size.min(NUM_CUSTODY_COLUMNS as usize);
     let mut rng = StdRng::seed_from_u64(seed ^ 0xC057_0DA5_C011_5EED);
     let mut cols: HashSet<u64> = HashSet::new();
-    while cols.len() < CUSTODY_SUBSET_SIZE {
+    while cols.len() < subset_size {
         cols.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
     }
     cols.into_iter().collect()

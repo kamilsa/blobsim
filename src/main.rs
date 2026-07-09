@@ -18,7 +18,7 @@ use crate::network::{
 use crate::state_machine::{run_blob_spammer, run_node};
 use crate::types::{
     custody_columns_for_seed, payload_blob_count, NodeRoles, Role, BLOBS_PER_SLOT,
-    EXEC_PAYLOAD_SIZE, MAX_BLOBS_PER_BLOCK, USABLE_BYTES_PER_BLOB,
+    CUSTODY_SUBSET_SIZE, EXEC_PAYLOAD_SIZE, MAX_BLOBS_PER_BLOCK, USABLE_BYTES_PER_BLOB,
 };
 
 use clap::Parser;
@@ -104,6 +104,12 @@ struct Cli {
     /// payload-envelope topic and relies on the column path.
     #[arg(long = "blocks-in-blobs", default_value_t = false)]
     blocks_in_blobs: bool,
+
+    /// Number of stable custody columns each non-builder CL node subscribes to and
+    /// fetches cells for (out of `NUM_CUSTODY_COLUMNS` = 128). Builders/proposers
+    /// always custody all columns. Clamped to 128.
+    #[arg(long = "custody-columns", default_value_t = CUSTODY_SUBSET_SIZE)]
+    custody_columns: usize,
 }
 
 // A single-threaded (current-thread) runtime: under Shadow every guest thread is
@@ -189,7 +195,7 @@ async fn main() {
     let column_subnets: Vec<u64> = if roles.is_builder() || roles.is_proposer() {
         all_column_subnets()
     } else {
-        custody_columns_for_seed(cli.seed)
+        custody_columns_for_seed(cli.seed, cli.custody_columns)
             .into_iter()
             .map(subnet_for_column)
             .collect()
@@ -234,6 +240,7 @@ async fn main() {
         cli.disable_get_blobs,
         cli.exec_payload_size,
         cli.blocks_in_blobs,
+        cli.custody_columns,
     )
     .await;
 }
