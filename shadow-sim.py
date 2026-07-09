@@ -96,7 +96,7 @@ def build_nodes(cfg: dict) -> list[Node]:
         log("warning: blob_spammers = 0 — no blobs will be originated; propagation "
             "will be empty. Set [topology].blob_spammers >= 1 for a meaningful run.")
     if zk_attesters > validators:
-        fail(f"zk_attesters ({zk_attesters}) exceeds validators ({validators})")
+        die(f"zk_attesters ({zk_attesters}) exceeds validators ({validators})")
 
     nodes: list[Node] = []
     nodes.append(Node(0, "proposer", ["proposer", "builder"], is_spammer=False))
@@ -541,14 +541,16 @@ def main() -> None:
     yaml_path = out_dir / "shadow.yaml"
     yaml_path.write_text(shadow_yaml)
 
-    validators = sum(1 for x in nodes if x.roles == ["validator"])
+    validators = sum(1 for x in nodes if "validator" in x.roles)
+    zk_attesters = sum(1 for x in nodes if "zk-attester" in x.roles)
     spammers = sum(1 for x in nodes if x.is_spammer)
     region_counts: dict[str, int] = {}
     for x in nodes:
         region_counts[x.region] = region_counts.get(x.region, 0) + 1
     log(f"generated {yaml_path}")
     log(f"  runner: {runner}")
-    log(f"  {n} hosts: 1 proposer+builder, {validators} validators, {spammers} spammers")
+    log(f"  {n} hosts: 1 proposer+builder, {validators} validators "
+        f"(of which {zk_attesters} zk-attesters), {spammers} spammers")
     log(f"  regions: {region_counts}")
 
     if args.dry_run:

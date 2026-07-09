@@ -151,10 +151,7 @@ impl ElBlobPool {
                 // custody cells arrived for it. Surfaces a broken fetch policy in
                 // debug; ignore them as a safe release fallback (the full blob
                 // already covers every column).
-                debug_assert!(
-                    false,
-                    "insert_cells for a hash already held as a full blob"
-                );
+                debug_assert!(false, "insert_cells for a hash already held as a full blob");
                 0
             }
             Some(ElBlobEntry::Partial(map)) => {
@@ -330,7 +327,8 @@ pub async fn run_node(
         // `n_payload` slots of `blob_kzg_commitments` (EIP-8142). Each is a full
         // BLOB_SIZE blob of builder-originated data under a fresh random hash that
         // no peer has seen over EL.
-        let mut block_blobs: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(n_payload + el_blobs.len());
+        let mut block_blobs: Vec<([u8; 32], Vec<u8>)> =
+            Vec::with_capacity(n_payload + el_blobs.len());
         for _ in 0..n_payload {
             let hash: [u8; 32] = random_bytes(&mut rng, 32)
                 .try_into()
@@ -397,8 +395,7 @@ pub async fn run_node(
             // Under blocks-in-blobs the payload *also* rides the column subnets as
             // payload-blobs (below); the two paths coexist, and only zk-attesters
             // (unsubscribed from this topic) rely solely on the column path.
-            let envelope =
-                SignedExecutionPayloadEnvelope::new(slot, node_index, exec_payload_size);
+            let envelope = SignedExecutionPayloadEnvelope::new(slot, node_index, exec_payload_size);
             publish_gossip(
                 swarm,
                 TOPIC_CL_PAYLOAD_ENVELOPE,

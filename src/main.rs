@@ -12,9 +12,14 @@ mod types;
 
 use crate::el_net::spawn_el_network;
 use crate::metrics::BandwidthMetrics;
-use crate::network::{all_column_subnets, build_swarm, dial_peers, subnet_for_column, subscribe_all};
+use crate::network::{
+    all_column_subnets, build_swarm, dial_peers, subnet_for_column, subscribe_all,
+};
 use crate::state_machine::{run_blob_spammer, run_node};
-use crate::types::{custody_columns_for_seed, NodeRoles, Role, BLOBS_PER_SLOT, EXEC_PAYLOAD_SIZE};
+use crate::types::{
+    custody_columns_for_seed, payload_blob_count, NodeRoles, Role, BLOBS_PER_SLOT,
+    EXEC_PAYLOAD_SIZE, MAX_BLOBS_PER_BLOCK, USABLE_BYTES_PER_BLOB,
+};
 
 use clap::Parser;
 use libp2p::Multiaddr;
@@ -118,6 +123,24 @@ async fn main() {
     let cli = Cli::parse();
     let roles = NodeRoles::from_roles(&cli.roles);
 
+    // Payload-blobs share the per-block blob budget with EL blobs (EIP-8142), so an
+    // execution payload that needs more than MAX_BLOBS_PER_BLOCK payload-blobs cannot
+    // fit — reject it rather than silently publishing an over-budget block.
+    if cli.blocks_in_blobs {
+        let n_payload = payload_blob_count(cli.exec_payload_size);
+        if n_payload > MAX_BLOBS_PER_BLOCK {
+            eprintln!(
+                "error: --blocks-in-blobs execution payload of {} bytes needs {} payload-blobs, \
+                 exceeding MAX_BLOBS_PER_BLOCK ({}). Reduce --exec-payload-size to at most {} bytes.",
+                cli.exec_payload_size,
+                n_payload,
+                MAX_BLOBS_PER_BLOCK,
+                MAX_BLOBS_PER_BLOCK * USABLE_BYTES_PER_BLOB,
+            );
+            std::process::exit(1);
+        }
+    }
+
     info!(
         roles = %roles,
         port = cli.port,
@@ -181,7 +204,12 @@ async fn main() {
 
     // Subscribe to gossipsub topics (data column subnets use partial messages when
     // partial columns are enabled; zk-attesters skip the payload-envelope topic).
-    subscribe_all(&mut swarm, enable_partial, subscribe_envelope, &column_subnets);
+    subscribe_all(
+        &mut swarm,
+        enable_partial,
+        subscribe_envelope,
+        &column_subnets,
+    );
 
     // Dial bootstrap peers
     if !cli.peers.is_empty() {
