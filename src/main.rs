@@ -12,9 +12,9 @@ mod types;
 
 use crate::el_net::spawn_el_network;
 use crate::metrics::BandwidthMetrics;
-use crate::network::{build_swarm, dial_peers, subscribe_all};
+use crate::network::{all_column_subnets, build_swarm, dial_peers, subnet_for_column, subscribe_all};
 use crate::state_machine::{run_blob_spammer, run_node};
-use crate::types::{NodeRoles, Role, BLOBS_PER_SLOT, EXEC_PAYLOAD_SIZE};
+use crate::types::{custody_columns_for_seed, NodeRoles, Role, BLOBS_PER_SLOT, EXEC_PAYLOAD_SIZE};
 
 use clap::Parser;
 use libp2p::Multiaddr;
@@ -90,6 +90,15 @@ struct Cli {
     /// columns are enabled.
     #[arg(long = "disable-get-blobs", default_value_t = false)]
     disable_get_blobs: bool,
+
+    /// Enable blocks-in-blobs (EIP-8142): the builder additionally encodes the
+    /// execution payload into payload-blobs (commitments first, sharing the
+    /// per-block blob budget) and seeds them onto the data column subnets, so the
+    /// payload propagates over both the envelope topic and columns. Implies
+    /// `--enable-partial-columns`. A node with the `zk-attester` role skips the
+    /// payload-envelope topic and relies on the column path.
+    #[arg(long = "blocks-in-blobs", default_value_t = false)]
+    blocks_in_blobs: bool,
 }
 
 // A single-threaded (current-thread) runtime: under Shadow every guest thread is
@@ -143,9 +152,36 @@ async fn main() {
     let (mut swarm, local_peer_id) = build_swarm(cli.seed, cli.port);
     info!(%local_peer_id, "swarm built");
 
-    // Subscribe to all gossipsub topics (data column subnets use partial
-    // messages when --enable-partial-columns is set).
-    subscribe_all(&mut swarm, cli.enable_partial_columns);
+    // Blocks-in-blobs propagates the payload over the data column subnets, which
+    // in this sim is the partial-message path — so the mode implies it.
+    let enable_partial = cli.enable_partial_columns || cli.blocks_in_blobs;
+    // A zk-attester (EIP-8142) does not subscribe to the payload-envelope topic;
+    // it only receives the payload-blob cells for its custody columns (partial
+    // payload — a non-supernode does not reconstruct the full payload).
+    let subscribe_envelope = !roles.is_zk_attester();
+
+    // A CL client subscribes only to the subnets of the columns it custodies; the
+    // block source (builder/proposer) must seed every column, so it joins all
+    // subnets (as a supernode — deferred — would). Column index == subnet here.
+    let column_subnets: Vec<u64> = if roles.is_builder() || roles.is_proposer() {
+        all_column_subnets()
+    } else {
+        custody_columns_for_seed(cli.seed)
+            .into_iter()
+            .map(subnet_for_column)
+            .collect()
+    };
+    info!(
+        zk_attester = roles.is_zk_attester(),
+        blocks_in_blobs = cli.blocks_in_blobs,
+        subscribe_envelope,
+        custody_subnets = column_subnets.len(),
+        "CL subscription profile"
+    );
+
+    // Subscribe to gossipsub topics (data column subnets use partial messages when
+    // partial columns are enabled; zk-attesters skip the payload-envelope topic).
+    subscribe_all(&mut swarm, enable_partial, subscribe_envelope, &column_subnets);
 
     // Dial bootstrap peers
     if !cli.peers.is_empty() {
@@ -166,9 +202,10 @@ async fn main() {
         cli.seed,
         cli.slots,
         &mut metrics,
-        cli.enable_partial_columns,
+        enable_partial,
         cli.disable_get_blobs,
         cli.exec_payload_size,
+        cli.blocks_in_blobs,
     )
     .await;
 }

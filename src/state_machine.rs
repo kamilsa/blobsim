@@ -265,16 +265,6 @@ impl PartialState {
     }
 }
 
-/// Deterministically pick a node's `CUSTODY_SUBSET_SIZE` custody columns from its seed.
-fn custody_columns_for_seed(seed: u64) -> Vec<u64> {
-    let mut rng = StdRng::seed_from_u64(seed ^ 0xC057_0DA5_C011_5EED);
-    let mut cols: HashSet<u64> = HashSet::new();
-    while cols.len() < CUSTODY_SUBSET_SIZE {
-        cols.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
-    }
-    cols.into_iter().collect()
-}
-
 /// Run the node's main loop for `num_slots` slots.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_node(
@@ -287,6 +277,7 @@ pub async fn run_node(
     enable_partial_columns: bool,
     disable_get_blobs: bool,
     exec_payload_size: usize,
+    blocks_in_blobs: bool,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -313,15 +304,40 @@ pub async fn run_node(
         // Forget inclusions older than the eviction window.
         el_blob_pool.prune_included(slot);
 
-        // Builder: select up to MAX_BLOBS_PER_BLOCK not-yet-included blobs from
+        // Blocks-in-blobs (EIP-8142): the builder knows the execution payload at
+        // slot start, so it encodes it into `n_payload` payload-blobs whose
+        // commitments come *first* in the block. These share the per-block blob
+        // budget with EL blobs and are generated locally by the builder — they are
+        // never announced/propagated over EL, so no other node holds them in its EL
+        // pool (this is what disables the cell-level delta optimization for them).
+        let n_payload = if blocks_in_blobs && roles.is_builder() {
+            payload_blob_count(exec_payload_size)
+        } else {
+            0
+        };
+
+        // Builder: select up to the remaining budget of not-yet-included blobs from
         // its EL pool to include in this slot's block; `take_pending` marks them
         // included (so they are never re-included) and leaves any overflow pooled
-        // for a later slot. Builders never generate blob data themselves.
-        let block_blobs: Vec<([u8; 32], Vec<u8>)> = if roles.is_builder() {
-            el_blob_pool.take_pending(MAX_BLOBS_PER_BLOCK, slot)
+        // for a later slot. Builders never generate EL blob data themselves.
+        let el_blobs: Vec<([u8; 32], Vec<u8>)> = if roles.is_builder() {
+            el_blob_pool.take_pending(MAX_BLOBS_PER_BLOCK.saturating_sub(n_payload), slot)
         } else {
             Vec::new()
         };
+
+        // Payload-blobs prepended so their commitments occupy the first
+        // `n_payload` slots of `blob_kzg_commitments` (EIP-8142). Each is a full
+        // BLOB_SIZE blob of builder-originated data under a fresh random hash that
+        // no peer has seen over EL.
+        let mut block_blobs: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(n_payload + el_blobs.len());
+        for _ in 0..n_payload {
+            let hash: [u8; 32] = random_bytes(&mut rng, 32)
+                .try_into()
+                .expect("32 random bytes");
+            block_blobs.push((hash, random_bytes(&mut rng, BLOB_SIZE)));
+        }
+        block_blobs.extend(el_blobs);
 
         // Commitments naming exactly the pooled blobs (embed their announced EL
         // hashes), shared by the t=0 proposal and the t=4-6 payload reveal.
@@ -348,6 +364,7 @@ pub async fn run_node(
             info!(
                 slot,
                 blobs = block_blobs.len(),
+                payload_blobs = n_payload,
                 "proposer: published beacon block proposal with blob commitments"
             );
         }
@@ -377,6 +394,9 @@ pub async fn run_node(
         if roles.is_builder() {
             // Publish the payload-reveal envelope. Blob commitments were already
             // announced in the t=0 proposal, so the envelope doesn't repeat them.
+            // Under blocks-in-blobs the payload *also* rides the column subnets as
+            // payload-blobs (below); the two paths coexist, and only zk-attesters
+            // (unsubscribed from this topic) rely solely on the column path.
             let envelope =
                 SignedExecutionPayloadEnvelope::new(slot, node_index, exec_payload_size);
             publish_gossip(
@@ -388,11 +408,12 @@ pub async fn run_node(
             info!(
                 slot,
                 blobs = block_blobs.len(),
+                payload_blobs = n_payload,
                 payload_bytes = exec_payload_size,
                 "builder: published payload envelope"
             );
 
-            // Wrap the pooled EL blobs as this block's sidecars.
+            // Wrap the pooled EL blobs (and any payload-blobs) as this block's sidecars.
             let blobs: Vec<BlobSidecar> = block_blobs
                 .iter()
                 .enumerate()

@@ -91,17 +91,23 @@ def build_nodes(cfg: dict) -> list[Node]:
     """Ordered node list: proposer (0), validators, then blob-spammers."""
     validators = int(cfg["topology"]["validators"])
     spammers = int(cfg["topology"]["blob_spammers"])
+    zk_attesters = int(cfg["topology"].get("zk_attesters", 0))
     if spammers == 0:
         log("warning: blob_spammers = 0 — no blobs will be originated; propagation "
             "will be empty. Set [topology].blob_spammers >= 1 for a meaningful run.")
+    if zk_attesters > validators:
+        fail(f"zk_attesters ({zk_attesters}) exceeds validators ({validators})")
 
     nodes: list[Node] = []
     nodes.append(Node(0, "proposer", ["proposer", "builder"], is_spammer=False))
 
+    # The first `zk_attesters` validators are zk-attesters (EIP-8142): they skip
+    # the payload-envelope topic and receive payload data over the column subnets.
     vwidth = max(3, len(str(validators)))
     for i in range(validators):
         idx = len(nodes)
-        nodes.append(Node(idx, f"validator{i:0{vwidth}d}", ["validator"], is_spammer=False))
+        roles = ["validator", "zk-attester"] if i < zk_attesters else ["validator"]
+        nodes.append(Node(idx, f"validator{i:0{vwidth}d}", roles, is_spammer=False))
 
     swidth = max(3, len(str(spammers)))
     for i in range(spammers):
@@ -253,6 +259,8 @@ def build_args(node: Node, cfg: dict, cl_peers: list[str], el_peers: list[str]) 
             parts.append("--enable-partial-columns")
         if sim.get("disable_get_blobs"):
             parts.append("--disable-get-blobs")
+        if sim.get("blocks_in_blobs"):
+            parts.append("--blocks-in-blobs")
 
     parts += ["--seed", str(seed), "--slots", str(slots)]
     for p in cl_peers:
