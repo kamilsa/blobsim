@@ -37,8 +37,9 @@ Each node is configured at startup with one or more roles:
 | Role | Behaviour |
 |---|---|
 | **Proposer** | Publishes beacon block proposals |
-| **Builder** | Releases payload envelope + blob sidecars, always requests full EL blobs |
+| **Builder** | Releases payload envelope + blob sidecars, always requests full EL blobs. Under `--blocks-in-blobs` (EIP-8142) it also encodes the execution payload into payload-blobs and seeds them onto the column subnets |
 | **Validator** | Non-builder CL node; for each announced EL blob independently chooses sampler behavior (85%) or provider behavior (15%) |
+| **ZK Attester** | A validator that verifies via zkEVM proofs (EIP-8142): does **not** subscribe to the payload-envelope topic and instead receives only the payload-blob cells for its custody columns (partial payload — a non-supernode does not reconstruct the full payload). Combined with `--role validator` |
 | **Blob Spammer** | EL-only load generator that originates blobs |
 
 ## 12-Second Slot Timeline
@@ -54,7 +55,7 @@ t=12s   Slot boundary → next slot
 ## Usage
 
 ```bash
-blob-sim --role <proposer|builder|validator|blob-spammer> \
+blob-sim --role <proposer|builder|validator|zk-attester|blob-spammer> \
          [--port <u16>] \
          [--el-port <u16>] \
          [--seed <u64>] \
@@ -130,12 +131,12 @@ Everything is driven by [`blobsim.toml`](blobsim.toml) — edit it to change a r
 different file as the positional argument; the launcher itself only takes `--dry-run`,
 `--rebuild`, `--clean`). Key knobs:
 
-- `[topology]` — `validators`, `blob_spammers`, and how many CL/EL peers each node dials.
+- `[topology]` — `validators`, `zk_attesters` (how many validators are zk-attesters, EIP-8142), `blob_spammers`, and how many CL/EL peers each node dials.
 - `[network]` — a **geo-realistic** model: each host is assigned a region and a
   bandwidth tier by weight, and inter-host latency comes from an inter-region latency
   matrix + per-edge jitter (ported from `lean-shadow-fuzzer`). Tune `[network.regions]`,
   `[network.bandwidths]`, and `jitter_ratio`.
-- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`, `enable_partial_columns`, `rust_log`.
+- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`, `enable_partial_columns`, `disable_get_blobs`, `blocks_in_blobs` (EIP-8142; also propagate the payload as payload-blobs over the column subnets, implies `enable_partial_columns`), `rust_log`.
 
 The whole topology is deterministic in `[sim].seed`: same config → byte-identical
 `shadow.yaml`/`topology.gml`.

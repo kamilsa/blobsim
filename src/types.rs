@@ -5,8 +5,10 @@
 //! stay within serde's default array-size support.
 
 use alloy_rlp::{Bytes, Decodable, RlpDecodable, RlpEncodable};
-use rand::RngCore;
+use rand::rngs::StdRng;
+use rand::{Rng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -24,6 +26,13 @@ pub enum Role {
     /// Non-builder CL node. For each announced blob it independently behaves as
     /// a sampler with 85% probability or a provider with 15% probability.
     Validator,
+    /// A CL attester that verifies blocks via zkEVM proofs (EIP-8142) and so does
+    /// not need the execution payload envelope: it does **not** subscribe to the
+    /// payload-envelope topic and instead receives only the payload-blob cells for
+    /// the columns it custodies over the column subnets — i.e. partial payload data
+    /// (a non-supernode never reconstructs the full payload; supernodes deferred).
+    /// Combined with `Validator`; off by default.
+    ZkAttester,
     /// EL-only blob load generator: originates and serves blobs at a configurable
     /// per-slot rate, paced across the slot. Holds no CL roles.
     BlobSpammer,
@@ -35,6 +44,7 @@ impl fmt::Display for Role {
             Self::Proposer => write!(f, "proposer"),
             Self::Builder => write!(f, "builder"),
             Self::Validator => write!(f, "validator"),
+            Self::ZkAttester => write!(f, "zk-attester"),
             Self::BlobSpammer => write!(f, "blob-spammer"),
         }
     }
@@ -47,6 +57,7 @@ impl std::str::FromStr for Role {
             "proposer" => Ok(Self::Proposer),
             "builder" => Ok(Self::Builder),
             "validator" => Ok(Self::Validator),
+            "zk-attester" | "zk_attester" | "zk" => Ok(Self::ZkAttester),
             "blob-spammer" | "blob_spammer" | "spammer" => Ok(Self::BlobSpammer),
             other => Err(format!("unknown role: {other}")),
         }
@@ -59,6 +70,7 @@ pub struct NodeRoles {
     pub proposer: bool,
     pub builder: bool,
     pub validator: bool,
+    pub zk_attester: bool,
     pub blob_spammer: bool,
 }
 
@@ -69,6 +81,7 @@ impl NodeRoles {
             proposer: false,
             builder: false,
             validator: false,
+            zk_attester: false,
             blob_spammer: false,
         };
         for r in roles {
@@ -76,10 +89,11 @@ impl NodeRoles {
                 Role::Proposer => nr.proposer = true,
                 Role::Builder => nr.builder = true,
                 Role::Validator => nr.validator = true,
+                Role::ZkAttester => nr.zk_attester = true,
                 Role::BlobSpammer => nr.blob_spammer = true,
             }
         }
-        let has_cl = nr.proposer || nr.builder || nr.validator;
+        let has_cl = nr.proposer || nr.builder || nr.validator || nr.zk_attester;
         assert!(
             !(nr.blob_spammer && has_cl),
             "blob-spammer is EL-only and cannot be combined with CL roles"
@@ -92,6 +106,11 @@ impl NodeRoles {
     }
     pub fn is_builder(&self) -> bool {
         self.builder
+    }
+    /// A zk-attester (EIP-8142): verifies via zkEVM proofs and therefore skips the
+    /// payload-envelope topic, relying on payload-blobs over the column subnets.
+    pub fn is_zk_attester(&self) -> bool {
+        self.zk_attester
     }
     pub fn is_blob_spammer(&self) -> bool {
         self.blob_spammer
@@ -109,6 +128,9 @@ impl fmt::Display for NodeRoles {
         }
         if self.validator {
             parts.push("validator");
+        }
+        if self.zk_attester {
+            parts.push("zk-attester");
         }
         if self.blob_spammer {
             parts.push("blob-spammer");
@@ -317,6 +339,18 @@ pub const NUM_CUSTODY_COLUMNS: u64 = 128;
 /// Number of stable custody columns assigned to each non-builder CL node.
 pub const CUSTODY_SUBSET_SIZE: usize = 4;
 
+/// Deterministically pick a node's [`CUSTODY_SUBSET_SIZE`] custody columns from its
+/// seed. A CL client subscribes only to these columns' subnets and only fetches
+/// their cells (a supernode — deferred — would custody all [`NUM_CUSTODY_COLUMNS`]).
+pub fn custody_columns_for_seed(seed: u64) -> Vec<u64> {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC057_0DA5_C011_5EED);
+    let mut cols: HashSet<u64> = HashSet::new();
+    while cols.len() < CUSTODY_SUBSET_SIZE {
+        cols.insert(rng.gen_range(0..NUM_CUSTODY_COLUMNS));
+    }
+    cols.into_iter().collect()
+}
+
 /// Size of a single cell (column) in bytes. PeerDAS cell = 64 field elements ×
 /// 32 B = 2 KiB.
 pub const BYTES_PER_CELL: usize = 2 * 1024;
@@ -338,7 +372,21 @@ pub const EXEC_PAYLOAD_SIZE: usize = 128 * 1024;
 
 /// Maximum blobs a builder includes in one block. Blobs beyond this stay pooled
 /// for a later slot; the cap is what makes cross-slot inclusion tracking matter.
+/// Under blocks-in-blobs (EIP-8142) the payload-blobs share this budget with the
+/// EL blobs (payload-blobs come first).
 pub const MAX_BLOBS_PER_BLOCK: usize = 6;
+
+/// Usable bytes a single blob can carry for EIP-8142 payload encoding: 4096 field
+/// elements × 31 usable bytes = 126,976 bytes. Used to size how many payload-blobs
+/// an execution payload of a given size occupies.
+pub const USABLE_BYTES_PER_BLOB: usize = 126_976;
+
+/// Number of payload-blobs (EIP-8142) an execution payload of `exec_payload_size`
+/// bytes occupies: `ceil(size / USABLE_BYTES_PER_BLOB)`. Zero for an empty payload.
+/// The block's first `payload_blob_count` commitments are the payload-blobs.
+pub fn payload_blob_count(exec_payload_size: usize) -> usize {
+    exec_payload_size.div_ceil(USABLE_BYTES_PER_BLOB)
+}
 
 impl SignedBeaconBlock {
     /// A proposal committing to the given (hash-bearing) blob KZG commitments —

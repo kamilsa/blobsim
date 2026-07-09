@@ -50,18 +50,17 @@ pub fn subnet_from_topic(topic: &str) -> Option<u64> {
     parts.next()?.parse().ok()
 }
 
-/// All data column subnet topics.
-pub fn all_data_column_topics() -> Vec<IdentTopic> {
-    (0..DATA_COLUMN_SIDECAR_SUBNET_COUNT)
-        .map(data_column_topic)
-        .collect()
+/// All data column subnets (0..count) — the set a block source / supernode joins.
+pub fn all_column_subnets() -> Vec<u64> {
+    (0..DATA_COLUMN_SIDECAR_SUBNET_COUNT).collect()
 }
 
-/// The always-on CL topics (baseline full-message path).
+/// The always-on CL topics (baseline full-message path). The payload-envelope
+/// topic is joined separately so zk-attesters can opt out of it (see
+/// [`subscribe_all`]).
 pub fn all_topics() -> Vec<IdentTopic> {
     vec![
         IdentTopic::new(TOPIC_CL_BEACON_BLOCK),
-        IdentTopic::new(TOPIC_CL_PAYLOAD_ENVELOPE),
         IdentTopic::new(TOPIC_CL_BLOB_SIDECAR),
     ]
 }
@@ -160,12 +159,30 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
 
 /// Subscribe the swarm to all simulation gossipsub topics.
 ///
-/// When `enable_partial_columns` is set, data column sidecar topics are joined
+/// When `enable_partial_columns` is set, the given `column_subnets` are joined
 /// via [`subscribe_partial`] (enabling the gossipsub 1.3 partial-message
 /// protocol) so blobs propagate as cell-level deltas. Otherwise only the
 /// baseline full-message topics are joined.
-pub fn subscribe_all(swarm: &mut Swarm<SimBehaviour>, enable_partial_columns: bool) {
-    for topic in all_topics() {
+///
+/// A CL client subscribes only to the subnets of the columns it custodies; the
+/// block source (builder/proposer) subscribes to all subnets so it can seed every
+/// column, and a supernode (deferred) would too. `column_subnets` carries that
+/// per-node set.
+///
+/// `subscribe_payload_envelope` gates joining the payload-envelope topic: a
+/// zk-attester (EIP-8142) passes `false` and instead receives only the
+/// payload-blob cells for its custody columns (partial payload).
+pub fn subscribe_all(
+    swarm: &mut Swarm<SimBehaviour>,
+    enable_partial_columns: bool,
+    subscribe_payload_envelope: bool,
+    column_subnets: &[u64],
+) {
+    let mut topics = all_topics();
+    if subscribe_payload_envelope {
+        topics.push(IdentTopic::new(TOPIC_CL_PAYLOAD_ENVELOPE));
+    }
+    for topic in topics {
         swarm
             .behaviour_mut()
             .gossipsub
@@ -175,12 +192,12 @@ pub fn subscribe_all(swarm: &mut Swarm<SimBehaviour>, enable_partial_columns: bo
     }
 
     if enable_partial_columns {
-        for topic in all_data_column_topics() {
-            subscribe_partial(swarm, &topic);
+        for &subnet in column_subnets {
+            subscribe_partial(swarm, &data_column_topic(subnet));
         }
         info!(
-            subnets = DATA_COLUMN_SIDECAR_SUBNET_COUNT,
-            "subscribed to data column subnets with partial messages enabled"
+            subnets = column_subnets.len(),
+            "subscribed to custody data column subnets with partial messages enabled"
         );
     }
 }
