@@ -7,9 +7,35 @@
 use crate::types::NodeRoles;
 use tracing::info;
 
+/// Layer (`cl`/`el`) a gossip topic belongs to, for the §5 traffic breakdown.
+fn gossip_layer(topic: &str) -> &'static str {
+    if topic.starts_with("/el/") {
+        "el"
+    } else {
+        "cl"
+    }
+}
+
+/// Coarse message kind for a gossip topic (§5 traffic breakdown).
+fn gossip_kind(topic: &str) -> &'static str {
+    if topic.contains("beacon_block") {
+        "block"
+    } else if topic.contains("payload_envelope") {
+        "envelope"
+    } else if topic.contains("blob_sidecar") {
+        "blob_sidecar"
+    } else if topic.contains("data_column_sidecar") {
+        "data_column"
+    } else {
+        "other"
+    }
+}
+
 /// Per-node bandwidth counters.
 pub struct BandwidthMetrics {
     roles_label: String,
+    /// Current slot, stamped onto per-message `traffic` events (§5).
+    current_slot: u64,
 
     // -- Per-slot counters (reset each slot) --
     el_bytes_sent: u64,
@@ -53,6 +79,7 @@ impl BandwidthMetrics {
     pub fn new(roles: &NodeRoles) -> Self {
         Self {
             roles_label: roles.to_string(),
+            current_slot: 0,
             el_bytes_sent: 0,
             el_bytes_received: 0,
             cl_bytes_sent: 0,
@@ -81,62 +108,86 @@ impl BandwidthMetrics {
 
     // -- Recording helpers --
 
+    /// Set the slot stamped onto subsequent per-message `traffic` events. Call at
+    /// the start of each slot.
+    pub fn set_slot(&mut self, slot: u64) {
+        self.current_slot = slot;
+    }
+
+    /// Emit one per-message `traffic` event (§5 intra-slot bandwidth). The message
+    /// kind is emitted as `mkind` (not `kind`) to avoid colliding with the reserved
+    /// `kind=` token that names the event type.
+    fn emit_traffic(&self, layer: &str, dir: &str, mkind: &str, bytes: usize) {
+        crate::event!(
+            "traffic",
+            self.current_slot,
+            layer = layer,
+            dir = dir,
+            mkind = mkind,
+            bytes = bytes
+        );
+    }
+
     /// Record a gossip message sent. Routes to CL or EL based on topic prefix.
     pub fn record_gossip_sent(&mut self, topic: &str, bytes: usize) {
-        let bytes = bytes as u64;
         if topic.starts_with("/el/") {
-            self.el_bytes_sent += bytes;
+            self.el_bytes_sent += bytes as u64;
         } else {
-            self.cl_bytes_sent += bytes;
+            self.cl_bytes_sent += bytes as u64;
         }
         self.gossip_messages_sent += 1;
+        self.emit_traffic(gossip_layer(topic), "out", gossip_kind(topic), bytes);
     }
 
     /// Record a gossip message received. Routes to CL or EL based on topic prefix.
     pub fn record_gossip_received(&mut self, topic: &str, bytes: usize) {
-        let bytes = bytes as u64;
         if topic.starts_with("/el/") {
-            self.el_bytes_received += bytes;
+            self.el_bytes_received += bytes as u64;
         } else {
-            self.cl_bytes_received += bytes;
+            self.cl_bytes_received += bytes as u64;
         }
         self.gossip_messages_received += 1;
+        self.emit_traffic(gossip_layer(topic), "in", gossip_kind(topic), bytes);
     }
 
     /// Record a gossip message forwarded to mesh peers (outgoing bandwidth).
     /// Routes to CL or EL based on topic prefix.
     pub fn record_gossip_forwarded(&mut self, topic: &str, bytes: usize) {
-        let bytes = bytes as u64;
         if topic.starts_with("/el/") {
-            self.el_bytes_sent += bytes;
+            self.el_bytes_sent += bytes as u64;
         } else {
-            self.cl_bytes_sent += bytes;
+            self.cl_bytes_sent += bytes as u64;
         }
         self.gossip_messages_forwarded += 1;
+        self.emit_traffic(gossip_layer(topic), "out", gossip_kind(topic), bytes);
     }
 
     /// Record an EL request-response request sent (requesting peer → holder).
     pub fn record_request_sent(&mut self, bytes: usize) {
         self.el_bytes_sent += bytes as u64;
         self.el_requests_sent += 1;
+        self.emit_traffic("el", "out", "el_request", bytes);
     }
 
     /// Record an EL request-response response received (holder → requesting peer).
     pub fn record_response_received(&mut self, bytes: usize) {
         self.el_bytes_received += bytes as u64;
         self.el_responses_received += 1;
+        self.emit_traffic("el", "in", "el_response", bytes);
     }
 
     /// Record an EL request-response request received (peer → Builder).
     pub fn record_request_received(&mut self, bytes: usize) {
         self.el_bytes_received += bytes as u64;
         self.el_requests_received += 1;
+        self.emit_traffic("el", "in", "el_request", bytes);
     }
 
     /// Record an EL request-response response sent (Builder → peer).
     pub fn record_response_sent(&mut self, bytes: usize) {
         self.el_bytes_sent += bytes as u64;
         self.el_responses_sent += 1;
+        self.emit_traffic("el", "out", "el_response", bytes);
     }
 
     /// Record an EL blob-hash announcement sent (Builder → peer). Call once per
@@ -144,12 +195,14 @@ impl BandwidthMetrics {
     pub fn record_el_announce_sent(&mut self, bytes: usize) {
         self.el_bytes_sent += bytes as u64;
         self.el_announces_sent += 1;
+        self.emit_traffic("el", "out", "announce", bytes);
     }
 
     /// Record an EL blob-hash announcement received.
     pub fn record_el_announce_received(&mut self, bytes: usize) {
         self.el_bytes_received += bytes as u64;
         self.el_announces_received += 1;
+        self.emit_traffic("el", "in", "announce", bytes);
     }
 
     /// Record a partial data-column message received via `Event::Partial`. The
@@ -163,6 +216,7 @@ impl BandwidthMetrics {
         if has_header {
             self.partial_headers_received += 1;
         }
+        self.emit_traffic("cl", "in", "partial_column", bytes);
     }
 
     /// Record that we published/seeded a data column via the partial protocol.

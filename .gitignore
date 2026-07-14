@@ -2,3 +2,16 @@ logs/
 .idea/
 target/
 shadow-output/
+
+# Observatory site (Astro) build + rendered notebooks
+site/node_modules/
+site/dist/
+site/.astro/
+site/rendered/*
+!site/rendered/.gitkeep
+
+# Python / uv
+.venv/
+notebooks/.venv/
+notebooks/.ipynb_checkpoints/
+__pycache__/

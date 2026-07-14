@@ -3,6 +3,8 @@
 //! Parses CLI arguments to assign the node's persona and starts the
 //! networking stack + slot ticker state machine.
 
+#[macro_use]
+mod events;
 mod el_net;
 mod metrics;
 mod network;

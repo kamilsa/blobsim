@@ -402,6 +402,40 @@ impl PartialColumnAssembler {
         }
     }
 
+    /// Whether every column in `custody` has fully assembled for this block — i.e.
+    /// the node's entire custody set is complete. False if the block is unknown or
+    /// `custody` is empty.
+    pub fn custody_set_complete(&self, block_root: &[u8; 32], custody: &[u64]) -> bool {
+        if custody.is_empty() {
+            return false;
+        }
+        match self.blocks.get(block_root) {
+            Some(block) => custody.iter().all(|c| block.complete.contains(c)),
+            None => false,
+        }
+    }
+
+    /// Custody-cell possession snapshot for a block: how many of the node's
+    /// `custody` columns' cells are already present locally, and the block's blob
+    /// count (= cells per column). Returns `(cells_held, n_blobs)`; `n_blobs` is 0
+    /// when the block's header is not yet known (nothing to possess).
+    pub fn custody_possession(&self, block_root: &[u8; 32], custody: &[u64]) -> (usize, usize) {
+        let Some(block) = self.blocks.get(block_root) else {
+            return (0, 0);
+        };
+        let n_blobs = block
+            .header
+            .as_ref()
+            .map(|h| h.kzg_commitments.len())
+            .unwrap_or(0);
+        let held: usize = custody
+            .iter()
+            .filter_map(|c| block.columns.get(c))
+            .map(|col| col.num_present())
+            .sum();
+        (held, n_blobs)
+    }
+
     /// Snapshot the current partial for a (block, column), for re-publishing our
     /// accumulated cells as a delta.
     pub fn current_partial(&self, block_root: &[u8; 32], index: u64) -> Option<PartialDataColumn> {

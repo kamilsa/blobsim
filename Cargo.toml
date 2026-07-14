@@ -37,3 +37,11 @@ alloy-rlp = { version = "0.3", features = ["derive"] }
 [patch.crates-io]
 quinn-udp = { path = "patch/quinn-udp" }
 
+# Local copy of the pinned rust-libp2p rev (891bf049) with one change: gossipsub's
+# partial-message state TTL (`DEFAULT_PARTIAL_TTL`) raised from 5 heartbeats
+# (~3.5s — expires before the builder seeds columns at t=4s, deadlocking the
+# cell-delta exchange) to 30 (~21s, outliving a 12s slot). See
+# vendor/rust-libp2p/protocols/gossipsub/src/extensions/partial_messages.rs.
+[patch."https://github.com/libp2p/rust-libp2p"]
+libp2p = { path = "vendor/rust-libp2p/libp2p" }
+

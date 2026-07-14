@@ -1,0 +1,38 @@
+[package]
+name = "autonatv2"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "MIT or Apache-2.0"
+
+[package.metadata.release]
+release = false
+
+[[bin]]
+name = "autonatv2_client"
+
+[[bin]]
+name = "autonatv2_server"
+
+[dependencies]
+libp2p = { workspace = true, features = ["macros", "tokio", "tcp", "noise", "yamux", "autonat", "identify", "dns", "quic"] }
+clap = { version = "4.6.1", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+rand = { workspace = true }
+opentelemetry = { version = "0.27.0", optional = true }
+opentelemetry_sdk = { version = "0.27.0", optional = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27.0", optional = true }
+tracing-opentelemetry = { version = "0.28.0", optional = true }
+cfg-if = "1.0.4"
+
+[features]
+jaeger = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+opentelemetry = ["dep:opentelemetry"]
+opentelemetry_sdk = ["dep:opentelemetry_sdk"]
+opentelemetry-otlp = ["dep:opentelemetry-otlp"]
+tracing-opentelemetry = ["dep:tracing-opentelemetry"]
+
+[lints]
+workspace = true

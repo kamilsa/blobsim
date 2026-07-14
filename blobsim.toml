@@ -15,8 +15,10 @@ runner = "docker"
 [sim]
 slots = 10                   # number of 12-second slots to simulate
 seed = 42                    # master RNG seed (topology + per-node keypairs)
+runs = 5                     # number of runs to execute back-to-back; run i uses seed+i,
+                             # each rendered as a separate run in the --serve observatory
 blobs_per_slot = 6           # blobs each blob-spammer originates per slot (spam rate)
-exec_payload_size_kib = 128  # size of the execution-payload (Execution Envelope) body a builder reveals per slot
+exec_payload_size_kib = 1024  # size of the execution-payload (Execution Envelope) body a builder reveals per slot
 enable_partial_columns = true   # gossipsub 1.3 partial messages / data-column sidecars
 disable_get_blobs = false        # only meaningful with enable_partial_columns
 blocks_in_blobs = true          # EIP-8142: also encode the exec payload into payload-blobs
@@ -25,11 +27,11 @@ rust_log = "info"            # per-node RUST_LOG; set "debug" for per-second met
 # stop_time = "130s"         # optional; default = slots*12s + 10s margin
 
 [topology]
-validators = 100             # non-builder CL nodes (choose sampler/provider per blob)
-zk_attesters = 0             # of the validators, how many are zk-attesters (EIP-8142):
+validators = 1024             # non-builder CL nodes (choose sampler/provider per blob)
+zk_attesters = 1024             # of the validators, how many are zk-attesters (EIP-8142):
                              # they skip the payload-envelope topic and get payload data
                              # only over the column subnets. Meaningful with blocks_in_blobs.
-blob_spammers = 4            # EL-only load generators that originate blobs
+blob_spammers = 0            # EL-only load generators that originate blobs
 peers_per_node = 50           # random CL (QUIC) peers each CL node dials (incl. proposer)
 el_peers_per_node = 50        # random EL (TCP) peers each node dials (incl. >=1 spammer)
 

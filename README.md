@@ -172,16 +172,19 @@ re-simulating:
 uv run shadow-sim.py --summary-only
 ```
 
-For interactive per-node bandwidth charts:
+For the full analysis notebook (network overview, per-blob p95 latency, cell
+possession at the attestation deadline, custody-fetch heatmaps, per-slot
+bandwidth), run the observatory:
 
 ```bash
-cd shadow-output && python ../create_notebook.py   # → Analysis.ipynb
+uv run shadow-sim.py --clean --serve       # run, render notebooks/analysis.ipynb, serve at :4321
+uv run shadow-sim.py --serve-only          # serve previously rendered runs without simulating
 ```
 
-> Note: `create_notebook.py`'s per-node example cells reference host names from the old
-> role model (`plot_per_second("builder")`, `"sampler4"`, `"provider1"`). Point them at
-> the current host names instead (`"proposer"`, `"validator000"`, …); the aggregate
-> charts key off `roles=` in the logs and work unchanged.
+It renders `notebooks/analysis.ipynb` against the run (via `scripts/render_notebooks.py`)
+and serves the static Astro observatory (`site/`) at http://0.0.0.0:4321. The
+`notebooks/loaders.py` parser turns the `EVENT`/`METRIC` logs into DataFrames — see
+[`metrics.md`](metrics.md) for the log schema.
 
 ### Building the binary directly
 

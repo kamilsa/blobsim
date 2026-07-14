@@ -1,0 +1,52 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import RunCard from '@/components/RunCard.astro';
+import { SiteData } from '@/lib/SiteData';
+
+const siteData = SiteData.load();
+const runs = siteData.runs;
+---
+
+<BaseLayout title="Home">
+  <div class="max-w-3xl">
+    <!-- Hero -->
+    <header class="mb-16">
+      <div class="mb-6 inline-flex items-center gap-2 px-3 py-1.5 font-mono text-[0.6875rem] tracking-widest uppercase" style="background: var(--muted); color: var(--muted-foreground);">
+        <span class="h-1.5 w-1.5 animate-pulse" style="background: var(--accent);"></span>
+        <span>{runs.length} runs</span>
+      </div>
+      <h1 class="m-0 mb-6 font-serif text-5xl font-normal leading-tight tracking-tight max-md:text-4xl">
+        <span style="color: var(--foreground);" class="block">Blobsim</span>
+        <span class="from-[var(--primary)] to-[var(--accent)] block bg-gradient-to-br bg-clip-text text-transparent">Observatory</span>
+      </h1>
+      <p class="max-w-xl text-lg leading-relaxed" style="color: var(--muted-foreground);">
+        Post-hoc analysis of blobsim Shadow runs. Browse completed runs and explore blob propagation, custody-column fetch latency, cell-level deltas, and per-slot bandwidth.
+      </p>
+    </header>
+
+    <!-- Run grid -->
+    <section>
+      <div class="mb-6 flex items-center justify-between">
+        <h2 class="m-0 font-serif text-2xl font-normal tracking-tight">Completed Runs</h2>
+      </div>
+      {runs.length === 0 ? (
+        <div class="rounded-lg border border-dashed p-10 text-center" style="border-color: var(--border); color: var(--muted-foreground);">
+          <p class="m-0 text-lg">No rendered runs yet.</p>
+          <p class="mt-2 text-sm" style="color: var(--muted-foreground);">
+            Run <code class="rounded px-1.5 py-0.5 font-mono text-xs" style="background: var(--muted);">uv run shadow-sim.py --clean --serve</code> to generate analysis.
+          </p>
+        </div>
+      ) : (
+        <div class="flex flex-col gap-3">
+          {runs.map((run) => (
+            <RunCard
+              runId={run.run_id}
+              metadata={run.metadata}
+              renderedAt={run.rendered_at}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  </div>
+</BaseLayout>

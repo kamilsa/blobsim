@@ -1,0 +1,104 @@
+@reference "./global.css";
+
+/* Notebook header */
+.notebook-header {
+  @apply mb-10 border-b pb-8;
+  border-color: var(--border);
+}
+
+.notebook-title {
+  @apply m-0 mb-5 font-serif text-4xl leading-tight font-normal;
+  color: var(--foreground);
+}
+
+.notebook-body {
+  @apply pb-20;
+}
+
+/* Section headings */
+.notebook-content h2 {
+  @apply relative border-b pb-2.5 font-serif font-normal text-[1.625rem] mt-14 mb-6;
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+.notebook-content h2::before {
+  @apply absolute bottom-[-1px] left-0 h-0.5 w-12;
+  content: '';
+  background: var(--primary);
+}
+
+.notebook-content h3 {
+  @apply font-serif text-xl font-normal mt-10 mb-4;
+  color: var(--foreground);
+}
+
+.notebook-content p {
+  @apply mb-5 mt-0 leading-relaxed;
+  color: var(--foreground);
+}
+
+/* Code blocks */
+.notebook-content .highlight,
+.notebook-content .input_area {
+  @apply relative overflow-x-auto text-[0.8125rem] leading-relaxed;
+  background: var(--muted);
+}
+
+.notebook-content .highlight pre {
+  @apply m-0 bg-transparent px-6 py-5;
+}
+
+.notebook-content .highlight code {
+  @apply bg-transparent p-0 font-mono text-sm;
+}
+
+/* Output cells */
+.notebook-content .output_wrapper {
+  @apply mb-5;
+}
+
+.notebook-content .output_area {
+  @apply px-6 py-4;
+  background: var(--muted);
+}
+
+/* Plotly charts - full width */
+.notebook-content .cell:has(.js-plotly-plot),
+.notebook-content .cell:has(.plotly-graph-div) {
+  @apply max-w-full;
+}
+
+.notebook-content .jp-OutputArea-child:has(.js-plotly-plot),
+.notebook-content .output_area:has(.js-plotly-plot),
+.notebook-content .jp-RenderedHTMLCommon:has(.js-plotly-plot) {
+  overflow-x: auto;
+  overflow-y: visible;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* Data tables */
+.notebook-content table {
+  @apply w-full border-collapse mb-5;
+}
+
+.notebook-content th,
+.notebook-content td {
+  @apply border px-4 py-2 text-left text-sm;
+  border-color: var(--border);
+}
+
+.notebook-content th {
+  @apply font-semibold;
+  background: var(--muted);
+}
+
+/* Error cells */
+.notebook-content .output_error {
+  @apply bg-red-50 px-6 py-4;
+}
+
+:global(.dark) .notebook-content .output_error {
+  background: oklch(0.2 0.05 25 / 30%);
+}

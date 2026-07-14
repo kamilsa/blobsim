@@ -32,8 +32,12 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// How many blocks the partial-column assembler and header tracker retain.
+/// The tracker must retain at least as many blocks as can be republished
+/// (assembler capacity): evicting a block's header-sent set while its columns
+/// can still be re-advertised would re-send phase-1 header messages to every
+/// peer on each republish.
 const ASSEMBLER_CAPACITY: usize = 16;
-const HEADER_TRACKER_CAPACITY: usize = 4;
+const HEADER_TRACKER_CAPACITY: usize = ASSEMBLER_CAPACITY;
 /// How many pending blobs the local EL blob pool retains (oldest evicted first).
 const EL_BLOB_POOL_CAPACITY: usize = 64;
 /// How many slots a blob is remembered as already-included, so it is neither
@@ -247,6 +251,9 @@ struct PartialState {
     header_tracker: PartialColumnHeaderTracker,
     /// Blocks whose custody columns we have already advertised/published once.
     custody_advertised_blocks: HashSet<[u8; 32]>,
+    /// Slots for which a `custody_complete` event has already been emitted, so the
+    /// §4 completion transition fires at most once per slot.
+    custody_complete_slots: HashSet<u64>,
 }
 
 impl PartialState {
@@ -258,7 +265,24 @@ impl PartialState {
             assembler: PartialColumnAssembler::new(ASSEMBLER_CAPACITY),
             header_tracker: PartialColumnHeaderTracker::new(HEADER_TRACKER_CAPACITY),
             custody_advertised_blocks: HashSet::new(),
+            custody_complete_slots: HashSet::new(),
         }
+    }
+}
+
+/// Emit a `custody_complete` event the first time this node's full custody set has
+/// assembled for a block (§4 fetch-completion timing). Guarded to fire once per slot.
+fn maybe_emit_custody_complete(partial_state: &mut PartialState, block_root: [u8; 32]) {
+    let slot = slot_for_block_root(&block_root);
+    if partial_state.custody_complete_slots.contains(&slot) {
+        return;
+    }
+    if partial_state
+        .assembler
+        .custody_set_complete(&block_root, &partial_state.custody_columns)
+    {
+        partial_state.custody_complete_slots.insert(slot);
+        event!("custody_complete", slot);
     }
 }
 
@@ -298,6 +322,8 @@ pub async fn run_node(
 
     for slot in 0..num_slots {
         info!(slot, %roles, "=== SLOT START ===");
+        event!("slot_start", slot);
+        metrics.set_slot(slot);
         let slot_start = Instant::now();
 
         // Forget inclusions older than the eviction window.
@@ -372,6 +398,14 @@ pub async fn run_node(
                 payload_blobs = n_payload,
                 "proposer: published beacon block proposal with blob commitments"
             );
+            let block_hashes: Vec<[u8; 32]> = block_blobs.iter().map(|(h, _)| *h).collect();
+            event!(
+                "block_published",
+                slot,
+                n_blobs = block_blobs.len(),
+                payload_blobs = n_payload,
+                blobs = crate::events::hash_list(&block_hashes)
+            );
         }
 
         // Drain events until t=4s
@@ -387,6 +421,47 @@ pub async fn run_node(
             &mut el_blob_pool,
         )
         .await;
+
+        // ---------------------------------------------------------------
+        // t=4s — Attestation deadline snapshot (§3 cell possession).
+        //
+        // At this point a partial-column node holds only the custody cells it
+        // derived from its local EL blob pool (getBlobs); the builder seeds the
+        // block's columns over CL *after* this deadline (t=4-6s). So `cells_held`
+        // here is exactly "% of custody cells already possessed after the EL
+        // fetch". Timing fields are placeholders (populated in later phases).
+        // ---------------------------------------------------------------
+        {
+            let block_root = block_root_for_slot(slot);
+            let (cells_held, n_blobs) = partial_state
+                .assembler
+                .custody_possession(&block_root, &partial_state.custody_columns);
+            let num_custody_columns = if roles.is_builder() {
+                NUM_CUSTODY_COLUMNS as usize
+            } else {
+                partial_state.custody_columns.len()
+            };
+            let cells_total = partial_state.custody_columns.len() * n_blobs;
+            let cl_peers = swarm.connected_peers().count();
+            event!(
+                "readiness",
+                slot,
+                is_cl_node = true,
+                is_builder = roles.is_builder(),
+                is_zk_attester = roles.is_zk_attester(),
+                eligible_envelope = !roles.is_builder() && !roles.is_zk_attester(),
+                eligible_custody = partial_state.enabled && !roles.is_builder(),
+                n_blobs = n_blobs,
+                num_custody_columns = num_custody_columns,
+                cells_held = cells_held,
+                cells_total = cells_total,
+                cl_peers = cl_peers,
+                el_peers = el_peer_count,
+                block_t_ms = crate::events::OptMs(None),
+                envelope_t_ms = crate::events::OptMs(None),
+                custody_complete_t_ms = crate::events::OptMs(None),
+            );
+        }
 
         // ---------------------------------------------------------------
         // t=4-6s — Payload & blob release phase (builder only)
@@ -461,6 +536,14 @@ pub async fn run_node(
                     columns = NUM_CUSTODY_COLUMNS,
                     "builder: seeded data columns via partial messages"
                 );
+                // Blob/column release time — §4 measures custody-fetch completion
+                // from this point.
+                event!(
+                    "columns_seeded",
+                    slot,
+                    columns = NUM_CUSTODY_COLUMNS,
+                    n_blobs = blobs.len()
+                );
             } else {
                 // Baseline path: publish full 128 KiB blob sidecars.
                 let count = blobs.len();
@@ -476,19 +559,32 @@ pub async fn run_node(
             }
         }
 
-        // Drain events until t=6s
-        drain_events_until(
-            swarm,
-            el,
-            roles,
-            &mut rng,
-            slot_start + Duration::from_secs(6),
-            metrics,
-            &mut el_peer_count,
-            &mut partial_state,
-            &mut el_blob_pool,
-        )
-        .await;
+        // t=5..11s — once per second, re-advertise custody columns still
+        // missing cells (for every tracked block, not just this slot's), so
+        // nodes whose advertisement expired from peers' partial-message state
+        // (~3.5s TTL) before the t=4s column seeding keep getting shots at the
+        // deltas (see `readvertise_incomplete_custody_columns`). By t=5s the
+        // t≈0 publish has aged out of our own behaviour cache everywhere, so
+        // the first re-advertisement is guaranteed to actually transmit;
+        // later passes give multi-hop stragglers more rounds. Once a column
+        // completes the sweep is a no-op, and while our cached publish is
+        // fresh the extension's stale-metadata check suppresses the resend, so
+        // steady-state cost is nil.
+        for readvertise_at in 5..=11 {
+            drain_events_until(
+                swarm,
+                el,
+                roles,
+                &mut rng,
+                slot_start + Duration::from_secs(readvertise_at),
+                metrics,
+                &mut el_peer_count,
+                &mut partial_state,
+                &mut el_blob_pool,
+            )
+            .await;
+            readvertise_incomplete_custody_columns(swarm, &mut partial_state);
+        }
 
         // Drain events until t=12s (slot boundary)
         drain_events_until(
@@ -507,6 +603,8 @@ pub async fn run_node(
         // Emit per-slot bandwidth summary
         metrics.emit_slot_summary(slot);
 
+        let cl_peers = swarm.connected_peers().count();
+        event!("slot_end", slot, cl_peers = cl_peers, el_peers = el_peer_count);
         info!(slot, "=== SLOT END ===");
     }
 
@@ -554,6 +652,8 @@ pub async fn run_blob_spammer(
 
     for slot in 0..num_slots {
         info!(slot, %roles, "=== SLOT START ===");
+        event!("slot_start", slot);
+        metrics.set_slot(slot);
         let slot_start = Instant::now();
         let slot_end = slot_start + Duration::from_secs(12);
 
@@ -576,6 +676,10 @@ pub async fn run_blob_spammer(
                 _ = ticker.tick(), if produced < blobs_per_slot => {
                     // Originate one random blob and announce its hash to EL peers.
                     let announce = BlobHashAnnounce::random(slot, 1, &mut rng);
+                    // Blob creation time (the origin timestamp §2 latencies measure from).
+                    for h in &announce.blob_hashes {
+                        event!("blob_offered", slot, blob = crate::events::hex_bytes(h));
+                    }
                     let frame_bytes = ElMessage::Announce(announce.clone()).encode().len() + 4;
                     el.announce(announce);
                     // Account the fan-out: one frame per connected peer.
@@ -706,7 +810,7 @@ fn handle_swarm_event(
             }
 
             // Deserialize the wrapper
-            if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
+            if let Ok(msg) = bincode::deserialize::<GossipMessage>(&message.data) {
                 // On seeing the t=0 proposal, a non-builder validator (a) if
                 // partials are enabled, records the block header and derives/
                 // advertises its custody columns from any of the block's blobs it
@@ -795,7 +899,21 @@ fn handle_swarm_event(
                             }
                             // Re-publish our accumulated cells so we can serve them
                             // to other mesh peers (multi-hop cell-delta cross-fill).
-                            if result.added_cells > 0 {
+                            // Also re-publish when the sender's metadata shows state
+                            // to repair (it holds cells we lack, or wants cells we
+                            // hold): the partial extension forgets all local/per-peer
+                            // state after ~3.5s (5 heartbeats), so by the time the
+                            // builder seeds columns at t=4s our t≈0 custody
+                            // advertisement has expired everywhere and must be
+                            // rebuilt on demand.
+                            if result.added_cells > 0
+                                || partial_repair_needed(
+                                    partial_state,
+                                    &column.block_root,
+                                    column.index,
+                                    metadata.as_deref(),
+                                )
+                            {
                                 republish_partial_column(
                                     swarm,
                                     partial_state,
@@ -803,6 +921,8 @@ fn handle_swarm_event(
                                     column.index,
                                 );
                             }
+                            // May have just completed our full custody set (§4).
+                            maybe_emit_custody_complete(partial_state, column.block_root);
                         }
                         Err(e) => {
                             debug!(error = %e, "failed to decode partial column; reporting invalid");
@@ -814,9 +934,24 @@ fn handle_swarm_event(
                     }
                 }
                 // Metadata-only exchange (no payload): account the metadata bytes.
-                (Some(_), None) => {
+                (Some(subnet), None) => {
                     if meta_bytes > 0 {
                         metrics.record_partial_received(meta_bytes, 0, false);
+                    }
+                    // A metadata-only message is the extension's "poke" after its
+                    // ~3.5s state TTL wiped a peer's view of us (e.g. the builder's
+                    // post-seed advertisement on subnets where the block header was
+                    // already delivered). If it reveals a mismatch, re-publish to
+                    // re-advertise our requests / serve the peer's.
+                    if let Some(block_root) = block_root_from_group_id(&group_id) {
+                        if partial_repair_needed(
+                            partial_state,
+                            &block_root,
+                            subnet,
+                            metadata.as_deref(),
+                        ) {
+                            republish_partial_column(swarm, partial_state, block_root, subnet);
+                        }
                     }
                 }
                 _ => {}
@@ -847,6 +982,14 @@ fn handle_swarm_event(
 fn handle_gossip_message(msg: GossipMessage) {
     match msg {
         GossipMessage::BeaconBlock(block) => {
+            // Per-node beacon-block arrival (gossipsub delivers once per node), for
+            // §3's block-propagation CDF.
+            event!(
+                "arrival",
+                block.slot,
+                atype = "block",
+                n_blobs = block.blob_kzg_commitments.len()
+            );
             info!(
                 slot = block.slot,
                 proposer = block.proposer_index,
@@ -963,6 +1106,12 @@ fn handle_full_payload(
     }
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&resp.blob_hash);
+    event!(
+        "arrival",
+        resp.slot,
+        atype = "full_payload",
+        blob = crate::events::hex_bytes(&hash)
+    );
 
     let pools_blobs =
         roles.is_builder() || (partial_state.enabled && partial_state.get_blobs_enabled);
@@ -1004,6 +1153,13 @@ fn handle_custody_response(
     }
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&resp.blob_hash);
+    event!(
+        "arrival",
+        resp.slot,
+        atype = "custody_cells",
+        blob = crate::events::hex_bytes(&hash),
+        cells = resp.cells.len()
+    );
 
     // Pool cells iff the getBlobs read path can consume them: when
     // `get_blobs_enabled` is false, `ensure_custody_columns` skips the pool
@@ -1219,7 +1375,11 @@ fn send_full_payload_request(
 // Gossip publish helper
 // ---------------------------------------------------------------------------
 
-/// Serialize a `GossipMessage` to JSON and publish it on the given topic.
+/// Serialize a `GossipMessage` with the compact binary codec and publish it on
+/// the given topic. JSON would encode the large byte payloads (execution
+/// payload, blob data) as number arrays — ~3.7 bytes on the wire per payload
+/// byte — nearly quadrupling the modeled cost of envelopes and sidecars and
+/// starving the builder's uplink right when it seeds columns.
 fn publish_gossip(
     swarm: &mut Swarm<SimBehaviour>,
     topic_str: &str,
@@ -1227,7 +1387,7 @@ fn publish_gossip(
     metrics: &mut BandwidthMetrics,
 ) {
     let topic = IdentTopic::new(topic_str);
-    let data = serde_json::to_vec(msg).expect("serialize gossip message");
+    let data = bincode::serialize(msg).expect("serialize gossip message");
 
     // Record outgoing gossip bytes
     metrics.record_gossip_sent(topic_str, data.len());
@@ -1343,6 +1503,9 @@ fn ensure_custody_columns(
             "advertised custody column requests over CL"
         );
     }
+
+    // getBlobs may have just completed our full custody set before any CL seeding (§4).
+    maybe_emit_custody_complete(partial_state, block_root);
 }
 
 /// Publish one full data column via the gossipsub 1.3 partial protocol, recording
@@ -1423,18 +1586,22 @@ fn republish_partial_column(
         .publish_partial(topic.hash(), outgoing);
 }
 
+/// Parse the block root out of a partial group id (`0x00 || block_root`).
+fn block_root_from_group_id(group_id: &[u8]) -> Option<[u8; 32]> {
+    if group_id.first() != Some(&PARTIAL_COLUMNS_VERSION_BYTE) || group_id.len() != 33 {
+        return None;
+    }
+    let mut block_root = [0u8; 32];
+    block_root.copy_from_slice(&group_id[1..33]);
+    Some(block_root)
+}
+
 /// Decode a gossipsub `Event::Partial` payload into a [`PartialDataColumn`]. The
 /// column index comes from the topic's subnet (1:1 under Fulu); the block root
 /// comes from the group id (`0x00 || block_root`).
 fn decode_partial(subnet: u64, group_id: &[u8], data: &[u8]) -> Result<PartialDataColumn, String> {
-    if group_id.first() != Some(&PARTIAL_COLUMNS_VERSION_BYTE) {
-        return Err(format!("unknown group id version: {:?}", group_id.first()));
-    }
-    if group_id.len() != 33 {
-        return Err(format!("bad group id length {}", group_id.len()));
-    }
-    let mut block_root = [0u8; 32];
-    block_root.copy_from_slice(&group_id[1..33]);
+    let block_root = block_root_from_group_id(group_id)
+        .ok_or_else(|| format!("bad group id (len {}): {:?}", group_id.len(), group_id.first()))?;
     let sidecar =
         PartialDataColumnSidecar::decode(data).map_err(|e| format!("decode sidecar: {e}"))?;
     Ok(PartialDataColumn {
@@ -1442,6 +1609,98 @@ fn decode_partial(subnet: u64, group_id: &[u8], data: &[u8]) -> Result<PartialDa
         index: subnet,
         sidecar,
     })
+}
+
+/// Whether a peer's advertised metadata calls for re-publishing our partial for
+/// `(block_root, index)`: the peer either holds cells we still lack (so
+/// re-advertising our `requests` prompts it to send them), or wants cells we
+/// hold (so re-publishing re-arms the behaviour's expired local cache and it
+/// serves the delta from our stored metadata of that peer).
+///
+/// This on-demand repair exists because the gossipsub partial extension expires
+/// every cached local partial and per-peer metadata after 5 heartbeats (~3.5s)
+/// without refresh, which is shorter than the proposal→column-seeding gap
+/// (t≈0 → t=4s). Re-publishing when both sides are already in sync is skipped
+/// by the extension's own stale-metadata check, so this stays quiet once a
+/// column has converged.
+fn partial_repair_needed(
+    partial_state: &PartialState,
+    block_root: &[u8; 32],
+    index: u64,
+    metadata: Option<&[u8]>,
+) -> bool {
+    if !partial_state.enabled {
+        return false;
+    }
+    let Some(bytes) = metadata else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    let Ok(peer_meta) = PartialDataColumnPartsMetadata::decode(bytes) else {
+        return false;
+    };
+    let ours = match partial_state.assembler.current_partial(block_root, index) {
+        Some(partial) => partial.sidecar.cells_present_bitmap,
+        None => CellBitmap::with_len(peer_meta.available.len()),
+    };
+    // Peer has cells we lack → re-advertise our requests so it sends them.
+    if !peer_meta.available.is_subset(&ours) {
+        return true;
+    }
+    // Peer wants cells we hold → re-publish so the behaviour serves the delta.
+    peer_meta
+        .requests
+        .difference(&peer_meta.available)
+        .intersects(&ours)
+}
+
+/// Re-advertise our custody columns that are still missing cells — for every
+/// tracked block with a known header — re-registering our `requests` bitmap
+/// with peers.
+///
+/// Safety net for the partial extension's ~3.5s state TTL: the custody
+/// advertisement made at proposal arrival (t≈0) has expired network-wide by the
+/// time the builder seeds columns at t=4s, and the reactive repair path
+/// ([`partial_repair_needed`]) only fires on an incoming poke — which a node
+/// outside the builder's mesh may not get, and which is silently dropped by the
+/// extension's stale-metadata check while our previous (expired-remotely but
+/// still cached locally) publish lingers. Calling this mid-slot, well past the
+/// TTL of the t≈0 publish, guarantees a fresh advertisement actually goes out;
+/// peers holding the missing cells respond with deltas. Covering all tracked
+/// blocks lets columns that spilled past their slot boundary finish instead of
+/// staying censored.
+fn readvertise_incomplete_custody_columns(
+    swarm: &mut Swarm<SimBehaviour>,
+    partial_state: &mut PartialState,
+) {
+    if !partial_state.enabled {
+        return;
+    }
+    let custody = partial_state.custody_columns.clone();
+    // Newest two blocks only (current + previous slot): that is where deltas
+    // can still realistically arrive, and sweeping older blocks just churns
+    // peers with advertisements nobody can serve anymore.
+    let recent_blocks: Vec<[u8; 32]> = partial_state
+        .assembler
+        .blocks_with_header()
+        .into_iter()
+        .rev()
+        .take(2)
+        .collect();
+    for block_root in recent_blocks {
+        for &index in &custody {
+            let incomplete = partial_state
+                .assembler
+                .current_partial(&block_root, index)
+                .map(|partial| !partial.sidecar.is_complete())
+                .unwrap_or(true);
+            if incomplete {
+                republish_partial_column(swarm, partial_state, block_root, index);
+            }
+        }
+    }
 }
 
 // Re-export the generated event type for the combined behaviour.
@@ -1522,6 +1781,97 @@ mod tests {
         pool.prune_included(INCLUDED_WINDOW_SLOTS);
         pool.insert_full(h(3), vec![3]);
         assert!(pool.contains(&h(3)));
+    }
+
+    // -- Partial-column repair (cell-delta re-advertisement) --
+
+    fn bitmap(len: usize, set: &[usize]) -> CellBitmap {
+        let mut b = CellBitmap::with_len(len);
+        for &i in set {
+            b.set(i);
+        }
+        b
+    }
+
+    fn meta(len: usize, available: &[usize], requests: &[usize]) -> Vec<u8> {
+        PartialDataColumnPartsMetadata {
+            available: bitmap(len, available),
+            requests: bitmap(len, requests),
+        }
+        .encode()
+    }
+
+    /// A partial-enabled state holding cells `held` (of `len` blob slots) for
+    /// (block `h(1)`, column 0).
+    fn state_with_cells(len: usize, held: &[usize]) -> PartialState {
+        let mut state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE);
+        let sidecar = PartialDataColumnSidecar {
+            cells_present_bitmap: bitmap(len, held),
+            column: held.iter().map(|_| vec![0xAA; BYTES_PER_CELL]).collect(),
+            kzg_proofs: held.iter().map(|_| vec![0xEE; KZG_ELEMENT_SIZE]).collect(),
+            header: None,
+        };
+        state.assembler.merge_partial(&PartialDataColumn {
+            block_root: h(1),
+            index: 0,
+            sidecar,
+        });
+        state
+    }
+
+    #[test]
+    fn repair_needed_when_peer_has_cells_we_lack() {
+        // We hold the 4 EL cells (2..6); the peer advertises the payload cells
+        // (0, 1) — the post-seed builder case. Must re-advertise our requests.
+        let state = state_with_cells(6, &[2, 3, 4, 5]);
+        let peer = meta(6, &[0, 1, 2, 3, 4, 5], &[0, 1, 2, 3, 4, 5]);
+        assert!(partial_repair_needed(&state, &h(1), 0, Some(&peer)));
+    }
+
+    #[test]
+    fn repair_needed_when_peer_wants_cells_we_hold() {
+        // The peer lacks cells 2..6 (wants everything) and we hold them: we must
+        // re-publish so the (possibly expired) behaviour cache serves the delta.
+        let state = state_with_cells(6, &[2, 3, 4, 5]);
+        let peer = meta(6, &[0, 1], &[0, 1, 2, 3, 4, 5]);
+        assert!(partial_repair_needed(&state, &h(1), 0, Some(&peer)));
+    }
+
+    #[test]
+    fn repair_not_needed_when_nothing_to_trade() {
+        // The peer only wants cells neither of us has, and holds a subset of
+        // ours — no message could make progress.
+        let state = state_with_cells(6, &[2, 3, 4, 5]);
+        let peer = meta(6, &[2, 3, 4, 5], &[0, 1, 2, 3, 4, 5]);
+        assert!(!partial_repair_needed(&state, &h(1), 0, Some(&peer)));
+    }
+
+    #[test]
+    fn repair_not_needed_when_both_sides_complete_or_meta_missing() {
+        let state = state_with_cells(6, &[0, 1, 2, 3, 4, 5]);
+        let peer = meta(6, &[0, 1, 2, 3, 4, 5], &[0, 1, 2, 3, 4, 5]);
+        assert!(!partial_repair_needed(&state, &h(1), 0, Some(&peer)));
+        assert!(!partial_repair_needed(&state, &h(1), 0, None));
+        assert!(!partial_repair_needed(&state, &h(1), 0, Some(&[])));
+    }
+
+    #[test]
+    fn repair_needed_for_unknown_column_when_peer_has_cells() {
+        // No local cells at all for the block: any advertised cell is one we lack.
+        let state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE);
+        let peer = meta(6, &[0, 1], &[0, 1]);
+        assert!(partial_repair_needed(&state, &h(9), 0, Some(&peer)));
+    }
+
+    #[test]
+    fn block_root_group_id_roundtrip() {
+        let mut group_id = vec![PARTIAL_COLUMNS_VERSION_BYTE];
+        group_id.extend_from_slice(&h(5));
+        assert_eq!(block_root_from_group_id(&group_id), Some(h(5)));
+        assert_eq!(block_root_from_group_id(&group_id[..32]), None);
+        let mut bad_version = group_id.clone();
+        bad_version[0] = 0x01;
+        assert_eq!(block_root_from_group_id(&bad_version), None);
     }
 
     // -- Partial (custody-cell) blob data --

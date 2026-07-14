@@ -1,9 +1,25 @@
-# Keep the build context small — target/ alone is hundreds of MB and is rebuilt
-# inside the image anyway.
+# Keep the Docker build context small. Only Cargo.toml, Cargo.lock, src/ and the
+# vendored patch/ override are needed to compile blob-sim (see docker/Dockerfile);
+# everything below is either rebuilt in the image or is analysis/observatory
+# tooling that is not a build input.
 target/
 logs/
 shadow-output/
 .git/
 .idea/
 .github/
+
+# Analysis notebooks + Python (uv) environments — hundreds of MB of venvs with
+# macOS-specific binaries/symlinks; not build inputs.
+notebooks/
+scripts/
+pyproject.toml
+uv.lock
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
 *.ipynb
+
+# Observatory site (Astro) — node_modules alone is ~185 MB; not a build input.
+site/

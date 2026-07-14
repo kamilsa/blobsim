@@ -21,17 +21,21 @@ Usage:
   uv run shadow-sim.py my.toml --clean      # remove previous shadow.data/ first
 
 Results land in `<output.dir>/shadow.data/hosts/<host>/blob-sim.1000.stdout`.
-Analyse them with `create_notebook.py` (see the README).
+Analyse them with the observatory: `uv run shadow-sim.py --clean --serve` renders
+`notebooks/analysis.ipynb` and serves it at http://0.0.0.0:4321 (see the README).
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import ipaddress
 import json
+import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tomllib
@@ -324,9 +328,9 @@ def image_exists(image: str) -> bool:
 
 
 def docker_build(image: str, shadow_image: str) -> None:
-    log(f"building image {image} on base {shadow_image} (docker build, arm64)...")
+    log(f"building image {image} on base {shadow_image} (docker build --no-cache, arm64)...")
     subprocess.run(
-        ["docker", "build", "--platform", "linux/arm64",
+        ["docker", "build", "--no-cache", "--platform", "linux/arm64",
          "-f", str(REPO_ROOT / "docker" / "Dockerfile"),
          "--build-arg", f"SHADOW_IMAGE={shadow_image}",
          "-t", image, str(REPO_ROOT)],
@@ -456,6 +460,161 @@ def summarize(out_dir: Path) -> None:
     log("────────────────────────────────────────────────────────────")
 
 
+# ── Observatory site (--serve / --serve-only) ────────────────────────────────
+# Mirrors lean-shadow-fuzzer: a static Astro site (site/) built with `npm run
+# build` and served with `astro preview` on :4321. After each finished run we
+# render the analysis notebook (scripts/render_notebooks.py) and rebuild the site
+# so the new run appears. `astro preview` serves dist/ from disk, so a rebuild is
+# picked up on the next page refresh without restarting the server.
+
+_site_process: "subprocess.Popen | None" = None
+
+
+def _start_observatory_site() -> None:
+    global _site_process
+    site_dir = REPO_ROOT / "site"
+    if not (site_dir / "package.json").is_file():
+        die(f"observatory site not found under {site_dir} — cannot --serve")
+    if not (site_dir / "node_modules").is_dir():
+        log("installing observatory site dependencies (npm install)…")
+        subprocess.run(["npm", "install"], cwd=str(site_dir), check=True)
+    log("building observatory site (npm run build)…")
+    subprocess.run(["npm", "run", "build"], cwd=str(site_dir), check=True)
+    log("starting observatory site (astro preview)…")
+    _site_process = subprocess.Popen(
+        ["npm", "run", "preview", "--", "--host", "0.0.0.0"],
+        cwd=str(site_dir),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,  # own process group so npm + astro both die on kill
+    )
+    log("observatory site: http://0.0.0.0:4321")
+
+
+def _stop_observatory_site() -> None:
+    global _site_process
+    if _site_process is None:
+        return
+    try:
+        os.killpg(os.getpgid(_site_process.pid), signal.SIGTERM)
+        _site_process.wait(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(os.getpgid(_site_process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _site_process = None
+
+
+def _handle_shutdown_signal(signum: int, frame) -> None:
+    log("shutting down observatory site…")
+    _stop_observatory_site()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _rebuild_site() -> None:
+    subprocess.run(
+        ["npm", "run", "build"],
+        cwd=str(REPO_ROOT / "site"),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _render_notebooks(out_dir: Path) -> None:
+    """Render the analysis notebook for a finished run, then rebuild the site."""
+    script = REPO_ROOT / "scripts" / "render_notebooks.py"
+    if not script.is_file():
+        log("render_notebooks.py not found — skipping notebook render")
+        return
+    log("rendering analysis notebooks…")
+    subprocess.run(
+        ["uv", "run", "--group", "notebooks", "python3", str(script),
+         "--run-dir", str(out_dir.resolve())],
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    _rebuild_site()
+
+
+def _clean_observatory_renders() -> None:
+    """Remove previously rendered notebooks + manifest from site/rendered/, so a
+    --clean run starts the observatory empty (mirrors --clean wiping shadow.data)."""
+    rendered_dir = REPO_ROOT / "site" / "rendered"
+    rendered_dir.mkdir(parents=True, exist_ok=True)
+    removed = False
+    for path in rendered_dir.iterdir():
+        if path.name == ".gitkeep":
+            continue
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink()
+        removed = True
+    (rendered_dir / "manifest.json").write_text('{"runs": {}}')
+    if removed:
+        log("cleaned previous observatory notebooks (site/rendered/)")
+
+
+def _serve_forever() -> None:
+    log("Browse the observatory at http://0.0.0.0:4321 — press Ctrl+C to stop.")
+    try:
+        signal.pause()
+    except KeyboardInterrupt:
+        pass
+
+
+def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int:
+    """Generate topology.gml, regions/bandwidths.json and shadow.yaml for one run at
+    `seed`. Mutates `cfg["sim"]["seed"]` so the per-node `--seed` (build_args) matches
+    this run. Returns the host count."""
+    cfg["sim"]["seed"] = seed
+    net = cfg["network"]
+    jitter_ratio = float(net.get("jitter_ratio", 0.3))
+    packet_loss = float(net.get("packet_loss", 0.0))
+    region_weights = {k: float(v) for k, v in cfg["network"]["regions"].items()}
+    bw_weights = {k: float(v) for k, v in cfg["network"]["bandwidths"].items()}
+
+    nodes = build_nodes(cfg)
+    n = len(nodes)
+    if n > 250:
+        log(f"warning: {n} nodes → a full inter-host mesh of {n * (n - 1) // 2} edges; "
+            "topology generation and Shadow start-up may be slow.")
+
+    # One seeded RNG for the geo topology (regions, bandwidths, then GML jitter); a
+    # separate stream for peer selection.
+    geo_rng = random.Random(seed)
+    regions = weighted_assign(region_weights, n, geo_rng)
+    bandwidths = weighted_assign(bw_weights, n, geo_rng)
+    for node, r, bw in zip(nodes, regions, bandwidths):
+        node.region, node.bandwidth = r, bw
+
+    gml_path = out_dir / "topology.gml"
+    gml_path.write_text(generate_gml(nodes, jitter_ratio, packet_loss, geo_rng))
+    (out_dir / "regions.json").write_text(
+        json.dumps({node.name: node.region for node in nodes}, indent=2))
+    (out_dir / "bandwidths.json").write_text(
+        json.dumps({node.name: node.bandwidth for node in nodes}, indent=2))
+
+    peer_rng = random.Random(seed + 1)
+    cl_peers = wire_cl_peers(nodes, int(cfg["topology"]["peers_per_node"]), peer_rng)
+    el_peers = wire_el_peers(nodes, int(cfg["topology"]["el_peers_per_node"]), peer_rng)
+    (out_dir / "shadow.yaml").write_text(
+        generate_shadow_yaml(nodes, cfg, gml_path, cl_peers, el_peers, blob_sim_bin))
+
+    validators = sum(1 for x in nodes if "validator" in x.roles)
+    zk_attesters = sum(1 for x in nodes if "zk-attester" in x.roles)
+    spammers = sum(1 for x in nodes if x.is_spammer)
+    region_counts: dict[str, int] = {}
+    for x in nodes:
+        region_counts[x.region] = region_counts.get(x.region, 0) + 1
+    log(f"  {n} hosts: 1 proposer+builder, {validators} validators "
+        f"(of which {zk_attesters} zk-attesters), {spammers} spammers; regions {region_counts}")
+    return n
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -466,9 +625,15 @@ def main() -> None:
                     help="generate shadow.yaml + topology.gml only; no build or run")
     ap.add_argument("--rebuild", action="store_true", help="force `docker build` first")
     ap.add_argument("--clean", action="store_true",
-                    help="remove a previous shadow.data/ before running")
+                    help="reset the observatory run list before running (shadow.data is "
+                         "always recreated fresh per run regardless)")
     ap.add_argument("--summary-only", action="store_true",
                     help="skip generation/build/run; just summarize an existing run")
+    ap.add_argument("--serve", "-s", action="store_true",
+                    help="run the sim, then render + serve the observatory site "
+                         "(http://0.0.0.0:4321) and keep serving until Ctrl+C")
+    ap.add_argument("--serve-only", action="store_true",
+                    help="start the observatory for existing runs without simulating")
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
@@ -478,6 +643,21 @@ def main() -> None:
         die(f"config not found: {cfg_path}")
     with cfg_path.open("rb") as f:
         cfg = tomllib.load(f)
+
+    # --serve / --serve-only: bring up the observatory (with clean shutdown wired).
+    if args.serve or args.serve_only:
+        atexit.register(_stop_observatory_site)
+        signal.signal(signal.SIGINT, _handle_shutdown_signal)
+        signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+        # Wipe old renders before the site is built so it comes up already empty.
+        if args.clean:
+            _clean_observatory_renders()
+        _start_observatory_site()
+
+    if args.serve_only:
+        log("serve-only: no simulation will run.")
+        _serve_forever()
+        return
 
     if args.summary_only:
         out_dir = Path(cfg["output"]["dir"])
@@ -499,81 +679,66 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.clean:
+
+    # --clean resets the observatory run list. shadow.data is always recreated fresh
+    # per run below (Shadow refuses an existing data directory), so a re-run no longer
+    # crashes on a leftover shadow.data.
+    if args.clean and not (args.serve or args.serve_only):
+        _clean_observatory_renders()
+
+    base_seed = int(cfg["sim"]["seed"])
+    runs = max(1, int(cfg["sim"].get("runs", 1)))
+
+    # Build the image / binary once (it does not change between runs).
+    image = None
+    if not args.dry_run:
+        if runner == "docker":
+            image = cfg["docker"]["image_name"]
+            shadow_image = cfg["docker"].get("shadow_image", "kamilsa/shadow-arm:tcpfix")
+            if args.rebuild or cfg["docker"].get("rebuild") or not image_exists(image):
+                docker_build(image, shadow_image)
+            else:
+                log(f"reusing existing image {image} (pass --rebuild to force a rebuild)")
+        else:
+            cargo_build_release()
+
+    if runs > 1:
+        log(f"running {runs} runs (seeds {base_seed}..{base_seed + runs - 1})")
+
+    for run_index in range(runs):
+        run_seed = base_seed + run_index
+        if runs > 1:
+            log(f"─── run {run_index + 1}/{runs}  (seed {run_seed}) ───")
+        _generate_run(cfg, out_dir, run_seed, blob_sim_bin)
+        log(f"  runner: {runner}")
+
+        if args.dry_run:
+            log("dry run — generated shadow.yaml only, skipping Shadow.")
+            continue
+
+        # Shadow requires a non-existent data directory; recreate it fresh each run.
         shutil.rmtree(out_dir / "shadow.data", ignore_errors=True)
+        if runner == "docker":
+            docker_run_shadow(image, out_dir)
+        else:
+            native_run_shadow(out_dir)
 
-    seed = int(cfg["sim"]["seed"])
-    net = cfg["network"]
-    jitter_ratio = float(net.get("jitter_ratio", 0.3))
-    packet_loss = float(net.get("packet_loss", 0.0))
-    region_weights = {k: float(v) for k, v in cfg["network"]["regions"].items()}
-    bw_weights = {k: float(v) for k, v in cfg["network"]["bandwidths"].items()}
+        (out_dir / "run-meta.json").write_text(json.dumps(
+            {"seed": run_seed, "run_index": run_index, "runs": runs}, indent=2))
+        summarize(out_dir)
 
-    nodes = build_nodes(cfg)
-    n = len(nodes)
-    if n > 250:
-        log(f"warning: {n} nodes → a full inter-host mesh of {n * (n - 1) // 2} edges; "
-            "topology generation and Shadow start-up may be slow.")
-
-    # One seeded RNG for the geo topology (mirrors the reference ordering: regions,
-    # bandwidths, then GML jitter); a separate stream for peer selection.
-    geo_rng = random.Random(seed)
-    regions = weighted_assign(region_weights, n, geo_rng)
-    bandwidths = weighted_assign(bw_weights, n, geo_rng)
-    for node, r, bw in zip(nodes, regions, bandwidths):
-        node.region, node.bandwidth = r, bw
-
-    gml = generate_gml(nodes, jitter_ratio, packet_loss, geo_rng)
-    gml_path = out_dir / "topology.gml"
-    gml_path.write_text(gml)
-
-    # Debug artifacts, matching the fuzzer's outputs.
-    (out_dir / "regions.json").write_text(
-        json.dumps({node.name: node.region for node in nodes}, indent=2))
-    (out_dir / "bandwidths.json").write_text(
-        json.dumps({node.name: node.bandwidth for node in nodes}, indent=2))
-
-    peer_rng = random.Random(seed + 1)
-    cl_peers = wire_cl_peers(nodes, int(cfg["topology"]["peers_per_node"]), peer_rng)
-    el_peers = wire_el_peers(nodes, int(cfg["topology"]["el_peers_per_node"]), peer_rng)
-
-    shadow_yaml = generate_shadow_yaml(nodes, cfg, gml_path, cl_peers, el_peers, blob_sim_bin)
-    yaml_path = out_dir / "shadow.yaml"
-    yaml_path.write_text(shadow_yaml)
-
-    validators = sum(1 for x in nodes if "validator" in x.roles)
-    zk_attesters = sum(1 for x in nodes if "zk-attester" in x.roles)
-    spammers = sum(1 for x in nodes if x.is_spammer)
-    region_counts: dict[str, int] = {}
-    for x in nodes:
-        region_counts[x.region] = region_counts.get(x.region, 0) + 1
-    log(f"generated {yaml_path}")
-    log(f"  runner: {runner}")
-    log(f"  {n} hosts: 1 proposer+builder, {validators} validators "
-        f"(of which {zk_attesters} zk-attesters), {spammers} spammers")
-    log(f"  regions: {region_counts}")
+        if args.serve:
+            _render_notebooks(out_dir)  # fresh run_id per call → accumulates on the site
 
     if args.dry_run:
-        log("dry run — skipping build and Shadow.")
         return
 
-    if runner == "docker":
-        image = cfg["docker"]["image_name"]
-        shadow_image = cfg["docker"].get("shadow_image", "kamilsa/shadow-arm:tcpfix")
-        if args.rebuild or cfg["docker"].get("rebuild") or not image_exists(image):
-            docker_build(image, shadow_image)
-        else:
-            log(f"reusing existing image {image} (pass --rebuild to force a rebuild)")
-        docker_run_shadow(image, out_dir)
-    else:  # native
-        cargo_build_release()
-        native_run_shadow(out_dir)
-
-    summarize(out_dir)
-
-    log("done. Results under:")
-    log(f"  {out_dir}/shadow.data/hosts/<host>/blob-sim.1000.stdout")
-    log(f"Analyse with:  (cd {out_dir} && python {REPO_ROOT}/create_notebook.py)")
+    if args.serve:
+        _serve_forever()
+    else:
+        log("done. Results under:")
+        log(f"  {out_dir}/shadow.data/hosts/<host>/blob-sim.1000.stdout")
+        log(f"Analyse with:  uv run --group notebooks python {REPO_ROOT}/scripts/render_notebooks.py")
 
 
 if __name__ == "__main__":
