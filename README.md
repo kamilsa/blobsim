@@ -204,7 +204,7 @@ cargo build --release   # → target/release/blob-sim
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `libp2p` | 0.54 | Gossipsub, Request-Response, QUIC transport |
+| `libp2p` | 0.57 ([fork](https://github.com/kamilsa/rust-libp2p/tree/blobsim-patches)) | Gossipsub (incl. 1.3 partial messages), QUIC transport. Pinned to a fork: the `partial-messages` feature is not yet on crates.io, and blob-sim carries three gossipsub patches — see the `[dependencies]` comment in `Cargo.toml`. |
 | `tokio` | 1.x | Async runtime |
 | `tracing` | 0.1 | Structured logging (Shadow log parsing) |
 | `clap` | 4.x | CLI argument parsing |

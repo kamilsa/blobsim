@@ -584,7 +584,7 @@ pub async fn run_node(
                 &mut el_blob_pool,
             )
             .await;
-            readvertise_incomplete_custody_columns(swarm, &mut partial_state);
+            readvertise_incomplete_custody_columns(swarm, &mut partial_state, metrics);
         }
 
         // Drain events until t=12s (slot boundary)
@@ -920,6 +920,7 @@ fn handle_swarm_event(
                                     partial_state,
                                     column.block_root,
                                     column.index,
+                                    metrics,
                                 );
                             }
                             // May have just completed our full custody set (§4).
@@ -951,7 +952,7 @@ fn handle_swarm_event(
                             subnet,
                             metadata.as_deref(),
                         ) {
-                            republish_partial_column(swarm, partial_state, block_root, subnet);
+                            republish_partial_column(swarm, partial_state, block_root, subnet, metrics);
                         }
                     }
                 }
@@ -1488,7 +1489,7 @@ fn ensure_custody_columns(
             if first_time && partial.sidecar.num_present() > 0 {
                 metrics.record_partial_column_published();
             }
-            republish_partial_column(swarm, partial_state, block_root, index);
+            republish_partial_column(swarm, partial_state, block_root, index, metrics);
         }
     }
     if pool_cells_added > 0 {
@@ -1554,7 +1555,10 @@ fn publish_column_partial(
         .gossipsub
         .publish_partial(topic.hash(), outgoing)
     {
-        Ok(()) => metrics.record_partial_column_published(),
+        Ok(bytes) => {
+            metrics.record_partial_column_published();
+            metrics.record_partial_sent(bytes);
+        }
         Err(e) => debug!(index, error = %e, "publish_partial failed"),
     }
 }
@@ -1567,6 +1571,7 @@ fn republish_partial_column(
     partial_state: &mut PartialState,
     block_root: [u8; 32],
     index: u64,
+    metrics: &mut BandwidthMetrics,
 ) {
     let Some(header) = partial_state.assembler.get_header(&block_root) else {
         return;
@@ -1581,10 +1586,16 @@ fn republish_partial_column(
     let outgoing =
         OutgoingPartialColumn::new(Arc::new(partial), &header, header_sent, request_cells);
     let topic = data_column_topic(subnet_for_column(index));
-    let _ = swarm
+    // Re-publish serves our accumulated cells (and re-advertises requests) to peers;
+    // account the payload it queues as outbound CL bandwidth, but without counting a
+    // new published column (this column was already counted at first publish).
+    if let Ok(bytes) = swarm
         .behaviour_mut()
         .gossipsub
-        .publish_partial(topic.hash(), outgoing);
+        .publish_partial(topic.hash(), outgoing)
+    {
+        metrics.record_partial_sent(bytes);
+    }
 }
 
 /// Parse the block root out of a partial group id (`0x00 || block_root`).
@@ -1675,6 +1686,7 @@ fn partial_repair_needed(
 fn readvertise_incomplete_custody_columns(
     swarm: &mut Swarm<SimBehaviour>,
     partial_state: &mut PartialState,
+    metrics: &mut BandwidthMetrics,
 ) {
     if !partial_state.enabled {
         return;
@@ -1698,7 +1710,7 @@ fn readvertise_incomplete_custody_columns(
                 .map(|partial| !partial.sidecar.is_complete())
                 .unwrap_or(true);
             if incomplete {
-                republish_partial_column(swarm, partial_state, block_root, index);
+                republish_partial_column(swarm, partial_state, block_root, index, metrics);
             }
         }
     }

@@ -48,13 +48,19 @@ event's message kind is therefore emitted as `mkind`, not `kind`.
 `traffic.mkind` values: `block`, `envelope`, `blob_sidecar`, `data_column`,
 `partial_column`, `el_request`, `el_response`, `announce`. High-volume — one line
 per message; the loader falls back to `METRIC` per-slot aggregates when absent.
+`partial_column` is emitted in **both** directions: `dir=in` on each received
+partial (`record_partial_received`) and `dir=out` on each publish/re-publish that
+queues cells to peers (`record_partial_sent`) — the outbound side is the dominant
+CL payload under EIP-8070 and must be present for the §5 send totals to be right.
 
 ## METRIC / SUMMARY lines (`metrics` target)
 
 `METRIC slot=<n> roles=<r> el_bytes_sent=… el_bytes_received=… cl_bytes_sent=…
 cl_bytes_received=… el_requests_sent=… … partial_cells_received=…
-partial_columns_completed=… partial_cells_pooled=…` — one per node per slot,
-per-slot byte/message counters. `SUMMARY roles=… slots=… total_*_bytes_* …
+partial_columns_published=… partial_bytes_sent=… partial_columns_completed=…
+partial_cells_pooled=…` — one per node per slot, per-slot byte/message counters.
+`partial_bytes_sent` (body + metadata bytes queued to peers) is the outbound
+counterpart of the inbound partial payload and is folded into `cl_bytes_sent`. `SUMMARY roles=… slots=… total_*_bytes_* …
 avg_*_per_slot=…` — one per node at shutdown. The loader parses `METRIC` into
 per-slot `slot_metric` bandwidth rows as the §5 fallback.
 

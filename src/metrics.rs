@@ -61,6 +61,9 @@ pub struct BandwidthMetrics {
     partial_cells_received: u64,
     /// Data columns published/seeded via the partial protocol.
     partial_columns_published: u64,
+    /// Payload bytes (partial body + metadata) sent to peers via the partial
+    /// protocol — the outbound counterpart of `partial_cells_received`.
+    partial_bytes_sent: u64,
     /// Columns that assembled to completion this slot.
     partial_columns_completed: u64,
     /// Custody cells received over EL and stored as partial blob data in the
@@ -97,6 +100,7 @@ impl BandwidthMetrics {
             partial_headers_received: 0,
             partial_cells_received: 0,
             partial_columns_published: 0,
+            partial_bytes_sent: 0,
             partial_columns_completed: 0,
             partial_cells_pooled: 0,
             total_el_bytes_sent: 0,
@@ -219,9 +223,25 @@ impl BandwidthMetrics {
         self.emit_traffic("cl", "in", "partial_column", bytes);
     }
 
-    /// Record that we published/seeded a data column via the partial protocol.
+    /// Record that we seeded a distinct data column via the partial protocol
+    /// (a counter only). Outbound bytes are accounted separately via
+    /// [`record_partial_sent`](Self::record_partial_sent), since the actual publish
+    /// may happen in a following re-publish call rather than here.
     pub fn record_partial_column_published(&mut self) {
         self.partial_columns_published += 1;
+    }
+
+    /// Account outbound partial-message bandwidth (body + metadata bytes queued to
+    /// peers) as CL send traffic. Used by every publish / re-publish path (seed,
+    /// cell-delta cross-fill, repair). A zero-byte publish (metadata-only "poke"
+    /// with no recipient needing data) is a no-op.
+    pub fn record_partial_sent(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.cl_bytes_sent += bytes as u64;
+        self.partial_bytes_sent += bytes as u64;
+        self.emit_traffic("cl", "out", "partial_column", bytes);
     }
 
     /// Record that a data column assembled to completion.
@@ -249,6 +269,7 @@ impl BandwidthMetrics {
              gossip_sent={} gossip_received={} gossip_forwarded={} \
              partial_msgs_received={} partial_headers_received={} \
              partial_cells_received={} partial_columns_published={} \
+             partial_bytes_sent={} \
              partial_columns_completed={} partial_cells_pooled={}",
             slot,
             self.roles_label,
@@ -269,6 +290,7 @@ impl BandwidthMetrics {
             self.partial_headers_received,
             self.partial_cells_received,
             self.partial_columns_published,
+            self.partial_bytes_sent,
             self.partial_columns_completed,
             self.partial_cells_pooled,
         );
@@ -297,6 +319,7 @@ impl BandwidthMetrics {
         self.partial_headers_received = 0;
         self.partial_cells_received = 0;
         self.partial_columns_published = 0;
+        self.partial_bytes_sent = 0;
         self.partial_columns_completed = 0;
         self.partial_cells_pooled = 0;
     }
