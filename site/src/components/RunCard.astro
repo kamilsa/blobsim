@@ -1,0 +1,61 @@
+---
+interface Props {
+  runId: string;
+  metadata: {
+    total_nodes?: number;
+    clients?: Record<string, number>;
+    status?: string;
+    duration_secs?: number;
+    runner?: string;
+    seed?: number;
+  };
+  renderedAt: string;
+}
+
+const { runId, metadata, renderedAt } = Astro.props;
+
+const totalNodes = metadata.total_nodes ?? 0;
+const clients = metadata.clients ?? {};
+const status = metadata.status ?? "unknown";
+const duration = metadata.duration_secs;
+const runner = metadata.runner ?? "unknown";
+
+const statusColors: Record<string, string> = {
+  complete: "bg-green-100 text-green-800",
+  warning: "bg-yellow-100 text-yellow-800",
+  error: "bg-red-100 text-red-800",
+  unknown: "bg-gray-100 text-gray-800",
+};
+
+const clientList = Object.entries(clients).map(([name, count]) => `${name}: ${count}`).join(", ");
+---
+
+<a
+  href={`/run/${runId}`}
+  class="group block border bg-[var(--card)] p-5 no-underline transition-all duration-200 hover:translate-x-1 hover:border-[var(--primary)] hover:shadow-[-4px_0_0_var(--primary)]"
+  style="border-color: var(--border);"
+>
+  <div class="mb-3 flex items-start justify-between">
+    <h3 class="m-0 text-[0.9375rem] font-semibold leading-tight text-[var(--foreground)]">
+      {runId}
+    </h3>
+    <span class={`rounded px-2 py-0.5 text-xs font-medium ${statusColors[status] ?? statusColors.unknown}`}>
+      {status}
+    </span>
+  </div>
+
+  <div class="text-[var(--muted-foreground)] mb-2 space-y-1 text-[0.8125rem]">
+    <div class="flex gap-4">
+      <span>{totalNodes} nodes</span>
+      {duration && <span>{duration}s</span>}
+      <span class="opacity-60">{runner}</span>
+    </div>
+    {clientList && (
+      <div class="opacity-70">Clients: {clientList}</div>
+    )}
+  </div>
+
+  <div class="text-[var(--muted-foreground)] text-[0.6875rem] opacity-60">
+    Rendered {new Date(renderedAt).toLocaleDateString()}
+  </div>
+</a>

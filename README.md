@@ -172,16 +172,19 @@ re-simulating:
 uv run shadow-sim.py --summary-only
 ```
 
-For interactive per-node bandwidth charts:
+For the full analysis notebook (network overview, per-blob p95 latency, cell
+possession at the attestation deadline, custody-fetch heatmaps, per-slot
+bandwidth), run the observatory:
 
 ```bash
-cd shadow-output && python ../create_notebook.py   # → Analysis.ipynb
+uv run shadow-sim.py --clean --serve       # run, render notebooks/analysis.ipynb, serve at :4321
+uv run shadow-sim.py --serve-only          # serve previously rendered runs without simulating
 ```
 
-> Note: `create_notebook.py`'s per-node example cells reference host names from the old
-> role model (`plot_per_second("builder")`, `"sampler4"`, `"provider1"`). Point them at
-> the current host names instead (`"proposer"`, `"validator000"`, …); the aggregate
-> charts key off `roles=` in the logs and work unchanged.
+It renders `notebooks/analysis.ipynb` against the run (via `scripts/render_notebooks.py`)
+and serves the static Astro observatory (`site/`) at http://0.0.0.0:4321. The
+`notebooks/loaders.py` parser turns the `EVENT`/`METRIC` logs into DataFrames — see
+[`metrics.md`](metrics.md) for the log schema.
 
 ### Building the binary directly
 
@@ -201,7 +204,7 @@ cargo build --release   # → target/release/blob-sim
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `libp2p` | 0.54 | Gossipsub, Request-Response, QUIC transport |
+| `libp2p` | 0.57 ([fork](https://github.com/kamilsa/rust-libp2p/tree/blobsim-patches)) | Gossipsub (incl. 1.3 partial messages), QUIC transport. Pinned to a fork: the `partial-messages` feature is not yet on crates.io, and blob-sim carries three gossipsub patches — see the `[dependencies]` comment in `Cargo.toml`. |
 | `tokio` | 1.x | Async runtime |
 | `tracing` | 0.1 | Structured logging (Shadow log parsing) |
 | `clap` | 4.x | CLI argument parsing |

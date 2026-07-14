@@ -1,0 +1,59 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import NotebookEmbed from '@/components/NotebookEmbed.astro';
+import { SiteData } from '@/lib/SiteData';
+
+export function getStaticPaths() {
+  const siteData = SiteData.load();
+  const runs = siteData.runs;
+  if (runs.length === 0) {
+    return [{ params: { runId: "_placeholder" } }];
+  }
+  return runs.map((run) => ({
+    params: { runId: run.run_id },
+  }));
+}
+
+const { runId } = Astro.params;
+const siteData = SiteData.load();
+const run = siteData.getRun(runId!);
+
+if (!run) {
+  return Astro.redirect('/404');
+}
+
+// Find the first notebook for this run
+const notebookEntries = Object.entries(run.notebooks);
+const notebookData = notebookEntries[0]?.[1];
+const htmlPath = notebookData?.html_path;
+const title = `${runId} — Analysis`;
+---
+
+<BaseLayout title={title}>
+  <div class="mb-6">
+    <a href="/" class="text-sm no-underline transition-colors" style="color: var(--muted-foreground);">
+      &larr; Back to runs
+    </a>
+  </div>
+
+  <div class="mb-8 flex flex-wrap items-center gap-4" style="color: var(--muted-foreground);">
+    <span class="rounded px-3 py-1 font-mono text-xs" style="background: var(--muted);">{runId}</span>
+    {run.metadata.total_nodes && (
+      <span class="text-sm">{run.metadata.total_nodes} nodes</span>
+    )}
+    {run.metadata.duration_secs && (
+      <span class="text-sm">{run.metadata.duration_secs}s simulation</span>
+    )}
+    {run.metadata.runner && (
+      <span class="text-sm opacity-60">{run.metadata.runner}</span>
+    )}
+  </div>
+
+  {htmlPath ? (
+    <NotebookEmbed htmlPath={htmlPath} title={`Run: ${runId}`} />
+  ) : (
+    <div class="rounded-lg border border-dashed p-10 text-center" style="border-color: var(--border); color: var(--muted-foreground);">
+      <p>No notebook data available for this run.</p>
+    </div>
+  )}
+</BaseLayout>

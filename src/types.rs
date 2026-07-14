@@ -647,6 +647,11 @@ impl CellBitmap {
     pub fn is_subset(&self, other: &Self) -> bool {
         (0..self.len).all(|i| !self.get(i) || other.get(i))
     }
+
+    /// True when `self` and `other` share at least one set bit.
+    pub fn intersects(&self, other: &Self) -> bool {
+        (0..self.len.min(other.len)).any(|i| self.get(i) && other.get(i))
+    }
 }
 
 /// The header carried once per block: the pieces needed to promote a completed

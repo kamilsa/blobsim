@@ -1,0 +1,71 @@
+---
+import fs from 'node:fs';
+import path from 'node:path';
+import '../styles/notebook.css';
+
+interface Props {
+  htmlPath: string;
+  title: string;
+}
+
+const { htmlPath, title } = Astro.props;
+
+const fullPath = path.join(process.cwd(), 'rendered', htmlPath);
+
+let content = '';
+let error = '';
+let headContent = '';
+
+if (fs.existsSync(fullPath)) {
+  const html = fs.readFileSync(fullPath, 'utf-8');
+
+  // Extract head content for styles (Plotly may inject styles)
+  const headMatch = html.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+  if (headMatch) {
+    const styleMatches = headMatch[1].match(/<style[^>]*>[\s\S]*?<\/style>/gi);
+    if (styleMatches) {
+      headContent = styleMatches.join('\n');
+    }
+  }
+
+  const bodyMatch = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+  if (bodyMatch) {
+    content = bodyMatch[1];
+  } else {
+    content = html;
+  }
+} else {
+  error = `Notebook not found: ${htmlPath}`;
+}
+---
+
+{
+  error ? (
+    <div class="error-container rounded-lg p-10 text-center">
+      <h2 class="mb-2 font-serif text-xl">Error Loading Notebook</h2>
+      <p class="font-mono text-sm opacity-80">{error}</p>
+    </div>
+  ) : (
+    <article class="notebook-content">
+      <header class="notebook-header mx-auto max-w-4xl">
+        <h1 class="notebook-title">{title}</h1>
+      </header>
+      <Fragment set:html={headContent} />
+      <div class="notebook-body" set:html={content} />
+    </article>
+  )
+}
+
+<style>
+  .error-container {
+    background: oklch(0.95 0.03 25 / 50%);
+    border: 1px solid oklch(0.85 0.08 25);
+    color: oklch(0.45 0.15 25);
+  }
+
+  :global(.dark) .error-container {
+    background: oklch(0.2 0.05 25 / 30%);
+    border-color: oklch(0.4 0.12 25);
+    color: oklch(0.75 0.12 25);
+  }
+</style>

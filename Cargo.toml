@@ -8,12 +8,32 @@ description = "Shadow-compatible Ethereum blob propagation simulator (EIP-7732 /
 name = "blob-sim"
 path = "src/main.rs"
 
-# libp2p is pinned to a rust-libp2p master rev because gossipsub 1.3 partial
-# messages (PR #6275, gossipsub 0.50.0 / umbrella 0.57.0) are not yet published
-# to crates.io. The `gossipsub-partial-messages` feature is the passthrough to
-# `libp2p-gossipsub/partial-messages`.
+# libp2p comes from a fork of rust-libp2p master rev 891bf049, for two reasons:
+#
+#  1. gossipsub 1.3 partial messages (PR #6275, gossipsub 0.50.0 / umbrella
+#     0.57.0) are not yet published to crates.io, hence a git rev rather than a
+#     crates.io version. The `gossipsub-partial-messages` feature below is the
+#     passthrough to `libp2p-gossipsub/partial-messages`.
+#
+#  2. blob-sim needs three patches on top of that rev, carried on the fork's
+#     `blobsim-patches` branch (two commits, both touching only
+#     protocols/gossipsub). To see exactly what they change:
+#       https://github.com/kamilsa/rust-libp2p/compare/891bf049...blobsim-patches
+#     They are:
+#       a. `DEFAULT_PARTIAL_TTL` raised 5 -> 30 heartbeats, so partial-message
+#          state outlives a 12s slot. Upstream's ~3.5s expires before the builder
+#          seeds columns at t=4s, deadlocking the cell-delta exchange.
+#       b. `handle_publish` no longer early-returns when republished metadata is
+#          unchanged; upstream's "stale data" skip silently dropped custody
+#          re-advertisements to peers whose view of us had expired.
+#       c. `publish_partial` returns the bytes it queued to peers, so outbound
+#          partial bandwidth can be accounted (see `record_partial_sent` in
+#          src/metrics.rs) -- the behaviour emits no outbound partial event.
+#
+# To re-sync onto a newer upstream rev: rebase `blobsim-patches` onto it, push,
+# and bump the `rev` below.
 [dependencies]
-libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "891bf049c63f65a1b9500b00c6d0a39afae175a2", features = [
+libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "519dfb55bb130728cb06a915a964bbfeca6fd22c", features = [
     "gossipsub",
     "gossipsub-partial-messages",
     "quic",
