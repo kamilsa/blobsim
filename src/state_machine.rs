@@ -300,6 +300,7 @@ pub async fn run_node(
     exec_payload_size: usize,
     blocks_in_blobs: bool,
     custody_columns: usize,
+    max_blobs_per_block: usize,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -351,7 +352,7 @@ pub async fn run_node(
         // included (so they are never re-included) and leaves any overflow pooled
         // for a later slot. Builders never generate EL blob data themselves.
         let el_blobs: Vec<([u8; 32], Vec<u8>)> = if roles.is_builder() {
-            el_blob_pool.take_pending(MAX_BLOBS_PER_BLOCK.saturating_sub(n_payload), slot)
+            el_blob_pool.take_pending(max_blobs_per_block.saturating_sub(n_payload), slot)
         } else {
             Vec::new()
         };

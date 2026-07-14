@@ -112,6 +112,12 @@ struct Cli {
     /// always custody all columns. Clamped to 128.
     #[arg(long = "custody-columns", default_value_t = CUSTODY_SUBSET_SIZE)]
     custody_columns: usize,
+
+    /// Maximum blobs a builder includes in one block. Under blocks-in-blobs the
+    /// payload-blobs share this budget with EL blobs (payload-blobs come first), so
+    /// it must cover `ceil(exec_payload_size / 126976)`.
+    #[arg(long = "max-blobs-per-block", default_value_t = MAX_BLOBS_PER_BLOCK)]
+    max_blobs_per_block: usize,
 }
 
 // A single-threaded (current-thread) runtime: under Shadow every guest thread is
@@ -132,18 +138,19 @@ async fn main() {
     let roles = NodeRoles::from_roles(&cli.roles);
 
     // Payload-blobs share the per-block blob budget with EL blobs (EIP-8142), so an
-    // execution payload that needs more than MAX_BLOBS_PER_BLOCK payload-blobs cannot
+    // execution payload that needs more than the budget's payload-blobs cannot
     // fit — reject it rather than silently publishing an over-budget block.
     if cli.blocks_in_blobs {
         let n_payload = payload_blob_count(cli.exec_payload_size);
-        if n_payload > MAX_BLOBS_PER_BLOCK {
+        if n_payload > cli.max_blobs_per_block {
             eprintln!(
                 "error: --blocks-in-blobs execution payload of {} bytes needs {} payload-blobs, \
-                 exceeding MAX_BLOBS_PER_BLOCK ({}). Reduce --exec-payload-size to at most {} bytes.",
+                 exceeding --max-blobs-per-block ({}). Reduce --exec-payload-size to at most {} \
+                 bytes or raise --max-blobs-per-block.",
                 cli.exec_payload_size,
                 n_payload,
-                MAX_BLOBS_PER_BLOCK,
-                MAX_BLOBS_PER_BLOCK * USABLE_BYTES_PER_BLOB,
+                cli.max_blobs_per_block,
+                cli.max_blobs_per_block * USABLE_BYTES_PER_BLOB,
             );
             std::process::exit(1);
         }
@@ -243,6 +250,7 @@ async fn main() {
         cli.exec_payload_size,
         cli.blocks_in_blobs,
         cli.custody_columns,
+        cli.max_blobs_per_block,
     )
     .await;
 }

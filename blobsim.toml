@@ -19,6 +19,9 @@ runs = 5                     # number of runs to execute back-to-back; run i use
                              # each rendered as a separate run in the --serve observatory
 blobs_per_slot = 6           # blobs each blob-spammer originates per slot (spam rate)
 exec_payload_size_kib = 1024  # size of the execution-payload (Execution Envelope) body a builder reveals per slot
+max_blobs_per_block = 10      # per-block blob budget; with blocks_in_blobs the payload-blobs
+                             # share it (each carries ~124 KiB of payload), so it must be
+                             # >= ceil(exec_payload_size_kib / 124). Default 6 if omitted.
 enable_partial_columns = true   # gossipsub 1.3 partial messages / data-column sidecars
 disable_get_blobs = false        # only meaningful with enable_partial_columns
 blocks_in_blobs = true          # EIP-8142: also encode the exec payload into payload-blobs

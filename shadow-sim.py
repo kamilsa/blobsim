@@ -54,6 +54,11 @@ EL_PORT = 9100   # devp2p-style TCP
 BLOB_SIM_BIN_DOCKER = "/opt/blobsim/blob-sim"
 BLOB_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "blob-sim")
 
+# Mirrors of src/types.rs constants, used to fail fast on configs blob-sim itself
+# would reject at startup (instead of dying mid-run inside a host log).
+USABLE_BYTES_PER_BLOB = 126_976   # 4096 field elements x 31 usable bytes
+MAX_BLOBS_PER_BLOCK = 6           # default per-block blob budget
+
 # Inter-region round-trip latencies in milliseconds, ported verbatim from
 # lean-shadow-fuzzer/shadow_fuzzer/generate_shadow_topology.py.
 REGIONS_LATENCY_MS: dict[str, dict[str, int]] = {
@@ -259,6 +264,8 @@ def build_args(node: Node, cfg: dict, cl_peers: list[str], el_peers: list[str]) 
         parts += ["--port", str(CL_PORT), "--el-port", str(EL_PORT),
                   "--exec-payload-size",
                   str(int(sim.get("exec_payload_size_kib", 128)) * 1024)]
+        if sim.get("max_blobs_per_block"):
+            parts += ["--max-blobs-per-block", str(int(sim["max_blobs_per_block"]))]
         if sim.get("enable_partial_columns"):
             parts.append("--enable-partial-columns")
         if sim.get("disable_get_blobs"):
@@ -643,6 +650,21 @@ def main() -> None:
         die(f"config not found: {cfg_path}")
     with cfg_path.open("rb") as f:
         cfg = tomllib.load(f)
+
+    # Fail fast on a payload that cannot fit the per-block blob budget (mirrors the
+    # startup check in src/main.rs) — otherwise every host exits and the run dies
+    # with the error buried in a per-host stderr log.
+    sim_cfg = cfg.get("sim", {})
+    if sim_cfg.get("blocks_in_blobs"):
+        payload_bytes = int(sim_cfg.get("exec_payload_size_kib", 128)) * 1024
+        budget = int(sim_cfg.get("max_blobs_per_block", MAX_BLOBS_PER_BLOCK))
+        n_payload = (payload_bytes + USABLE_BYTES_PER_BLOB - 1) // USABLE_BYTES_PER_BLOB
+        if n_payload > budget:
+            die(f"[sim].exec_payload_size_kib = {payload_bytes // 1024} KiB needs "
+                f"{n_payload} payload-blobs, exceeding the per-block blob budget of "
+                f"{budget}. Raise [sim].max_blobs_per_block to at least {n_payload} "
+                f"or reduce the payload to at most "
+                f"{budget * USABLE_BYTES_PER_BLOB // 1024} KiB.")
 
     # --serve / --serve-only: bring up the observatory (with clean shutdown wired).
     if args.serve or args.serve_only:
