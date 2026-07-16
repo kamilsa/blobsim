@@ -132,10 +132,10 @@ different file as the positional argument; the launcher itself only takes `--dry
 `--rebuild`, `--clean`). Key knobs:
 
 - `[topology]` — `validators`, `zk_attesters` (how many validators are zk-attesters, EIP-8142), `blob_spammers`, and how many CL/EL peers each node dials.
-- `[network]` — a **geo-realistic** model: each host is assigned a region and a
-  bandwidth tier by weight, and inter-host latency comes from an inter-region latency
-  matrix + per-edge jitter (ported from `lean-shadow-fuzzer`). Tune `[network.regions]`,
-  `[network.bandwidths]`, and `jitter_ratio`.
+- `[network]` — a **geo-realistic** model: each host is assigned a region, while
+  `supernode_fraction` selects an exact seeded fraction of CL hosts that custody all
+  128 columns. Set `supernode_bandwidth` and `non_supernode_bandwidth` independently;
+  inter-host latency comes from an inter-region matrix + per-edge jitter.
 - `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`, `enable_partial_columns`, `disable_get_blobs`, `blocks_in_blobs` (EIP-8142; also propagate the payload as payload-blobs over the column subnets, implies `enable_partial_columns`), `rust_log`.
 
 The whole topology is deterministic in `[sim].seed`: same config → byte-identical

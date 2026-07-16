@@ -200,7 +200,8 @@ async fn main() {
 
     // A CL client subscribes only to the subnets of the columns it custodies; the
     // block source (builder/proposer) must seed every column, so it joins all
-    // subnets (as a supernode — deferred — would). Column index == subnet here.
+    // subnets, as does a supernode configured with all 128 custody columns.
+    // Column index == subnet here.
     let column_subnets: Vec<u64> = if roles.is_builder() || roles.is_proposer() {
         all_column_subnets()
     } else {

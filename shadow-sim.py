@@ -58,6 +58,7 @@ BLOB_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "blob-sim")
 # would reject at startup (instead of dying mid-run inside a host log).
 USABLE_BYTES_PER_BLOB = 126_976   # 4096 field elements x 31 usable bytes
 MAX_BLOBS_PER_BLOCK = 6           # default per-block blob budget
+NUM_CUSTODY_COLUMNS = 128         # full custody set for supernodes
 
 # Inter-region round-trip latencies in milliseconds, ported verbatim from
 # lean-shadow-fuzzer/shadow_fuzzer/generate_shadow_topology.py.
@@ -93,6 +94,7 @@ class Node:
         self.ip = ""                # assigned later
         self.region = ""            # assigned later
         self.bandwidth = ""         # assigned later
+        self.is_supernode = False    # assigned later for CL hosts
         self.spammer_ordinal = 0    # --node-id for blob-spammers
 
 
@@ -132,15 +134,24 @@ def build_nodes(cfg: dict) -> list[Node]:
     return nodes
 
 
-# ── Geo topology (regions, bandwidths, GML) ──────────────────────────────────
+# ── Geo topology (regions, supernodes, GML) ──────────────────────────────────
 # Ported from lean-shadow-fuzzer/shadow_fuzzer/generate_shadow_topology.py so the
-# latency model matches the fuzzer's: weighted region + bandwidth assignment and a
-# full inter-host mesh whose edge latencies come from REGIONS_LATENCY_MS + jitter.
+# latency model matches the fuzzer's: weighted region assignment and a full inter-host
+# mesh whose edge latencies come from REGIONS_LATENCY_MS + jitter.
 
 def weighted_assign(weights: dict[str, float], count: int, rng: random.Random) -> list[str]:
     keys = list(weights.keys())
     vals = list(weights.values())
     return [rng.choices(keys, weights=vals, k=1)[0] for _ in range(count)]
+
+
+def assign_supernodes(nodes: list[Node], fraction: float, rng: random.Random) -> int:
+    """Mark an exact, seeded fraction of CL hosts as supernodes."""
+    cl_nodes = [node for node in nodes if not node.is_spammer]
+    count = int(len(cl_nodes) * fraction + 0.5)
+    for node in rng.sample(cl_nodes, count):
+        node.is_supernode = True
+    return count
 
 
 def generate_gml(nodes: list[Node], jitter_ratio: float, packet_loss: float,
@@ -272,6 +283,8 @@ def build_args(node: Node, cfg: dict, cl_peers: list[str], el_peers: list[str]) 
             parts.append("--disable-get-blobs")
         if sim.get("blocks_in_blobs"):
             parts.append("--blocks-in-blobs")
+        if node.is_supernode:
+            parts += ["--custody-columns", str(NUM_CUSTODY_COLUMNS)]
 
     parts += ["--seed", str(seed), "--slots", str(slots)]
     for p in cl_peers:
@@ -581,8 +594,16 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int
     net = cfg["network"]
     jitter_ratio = float(net.get("jitter_ratio", 0.3))
     packet_loss = float(net.get("packet_loss", 0.0))
-    region_weights = {k: float(v) for k, v in cfg["network"]["regions"].items()}
-    bw_weights = {k: float(v) for k, v in cfg["network"]["bandwidths"].items()}
+    region_weights = {k: float(v) for k, v in net["regions"].items()}
+    supernode_fraction = float(net.get("supernode_fraction", 0.05))
+    supernode_bandwidth = str(net.get("supernode_bandwidth", "1 Gbit"))
+    non_supernode_bandwidth = str(net.get("non_supernode_bandwidth", "50 Mbit"))
+    if not 0.0 <= supernode_fraction <= 1.0:
+        die(f"[network].supernode_fraction must be between 0 and 1, got "
+            f"{supernode_fraction}")
+    if "bandwidths" in net:
+        die("[network.bandwidths] has been replaced by [network].supernode_fraction, "
+            "supernode_bandwidth, and non_supernode_bandwidth")
 
     nodes = build_nodes(cfg)
     n = len(nodes)
@@ -590,13 +611,15 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int
         log(f"warning: {n} nodes → a full inter-host mesh of {n * (n - 1) // 2} edges; "
             "topology generation and Shadow start-up may be slow.")
 
-    # One seeded RNG for the geo topology (regions, bandwidths, then GML jitter); a
+    # One seeded RNG for the geo topology (regions, supernodes, then GML jitter); a
     # separate stream for peer selection.
     geo_rng = random.Random(seed)
     regions = weighted_assign(region_weights, n, geo_rng)
-    bandwidths = weighted_assign(bw_weights, n, geo_rng)
-    for node, r, bw in zip(nodes, regions, bandwidths):
-        node.region, node.bandwidth = r, bw
+    supernode_count = assign_supernodes(nodes, supernode_fraction, geo_rng)
+    for node, region in zip(nodes, regions):
+        node.region = region
+        node.bandwidth = (supernode_bandwidth if node.is_supernode
+                          else non_supernode_bandwidth)
 
     gml_path = out_dir / "topology.gml"
     gml_path.write_text(generate_gml(nodes, jitter_ratio, packet_loss, geo_rng))
@@ -618,7 +641,8 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int
     for x in nodes:
         region_counts[x.region] = region_counts.get(x.region, 0) + 1
     log(f"  {n} hosts: 1 proposer+builder, {validators} validators "
-        f"(of which {zk_attesters} zk-attesters), {spammers} spammers; regions {region_counts}")
+        f"(of which {zk_attesters} zk-attesters), {spammers} spammers; "
+        f"{supernode_count} supernodes; regions {region_counts}")
     return n
 
 

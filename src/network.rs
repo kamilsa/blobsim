@@ -166,7 +166,7 @@ pub fn build_swarm(seed: u64, listen_port: u16) -> (Swarm<SimBehaviour>, PeerId)
 ///
 /// A CL client subscribes only to the subnets of the columns it custodies; the
 /// block source (builder/proposer) subscribes to all subnets so it can seed every
-/// column, and a supernode (deferred) would too. `column_subnets` carries that
+/// column, and a supernode does too. `column_subnets` carries that
 /// per-node set.
 ///
 /// `subscribe_payload_envelope` gates joining the payload-envelope topic: a

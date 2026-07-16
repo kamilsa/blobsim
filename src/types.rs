@@ -30,7 +30,7 @@ pub enum Role {
     /// not need the execution payload envelope: it does **not** subscribe to the
     /// payload-envelope topic and instead receives only the payload-blob cells for
     /// the columns it custodies over the column subnets — i.e. partial payload data
-    /// (a non-supernode never reconstructs the full payload; supernodes deferred).
+    /// (a non-supernode never reconstructs the full payload).
     /// Combined with `Validator`; off by default.
     ZkAttester,
     /// EL-only blob load generator: originates and serves blobs at a configurable
@@ -342,7 +342,7 @@ pub const CUSTODY_SUBSET_SIZE: usize = 8;
 
 /// Deterministically pick a node's `subset_size` custody columns from its seed. A
 /// CL client subscribes only to these columns' subnets and only fetches their
-/// cells (a supernode — deferred — would custody all [`NUM_CUSTODY_COLUMNS`]).
+/// cells; a supernode passes [`NUM_CUSTODY_COLUMNS`] to custody every column.
 /// `subset_size` is clamped to [`NUM_CUSTODY_COLUMNS`] to keep the loop bounded.
 pub fn custody_columns_for_seed(seed: u64, subset_size: usize) -> Vec<u64> {
     let subset_size = subset_size.min(NUM_CUSTODY_COLUMNS as usize);

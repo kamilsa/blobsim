@@ -1,8 +1,8 @@
 # blobsim.toml — configuration for `uv run shadow-sim.py`.
 #
 # Describes a single Shadow simulation: how many nodes of each role, how they are
-# wired over CL (QUIC) and EL (TCP), and a geo-realistic network (per-host region +
-# bandwidth, inter-region latency matrix + jitter). Edit this file to change a run;
+# wired over CL (QUIC) and EL (TCP), and a geo-realistic network (per-host region,
+# supernode class + bandwidth, inter-region latency matrix + jitter). Edit this file;
 # the launcher takes only operational flags (config path, --dry-run, --rebuild, --clean).
 
 [run]
@@ -18,7 +18,7 @@ seed = 42                    # master RNG seed (topology + per-node keypairs)
 runs = 5                     # number of runs to execute back-to-back; run i uses seed+i,
                              # each rendered as a separate run in the --serve observatory
 blobs_per_slot = 6           # blobs each blob-spammer originates per slot (spam rate)
-exec_payload_size_kib = 1024  # size of the execution-payload (Execution Envelope) body a builder reveals per slot
+exec_payload_size_kib = 512  # size of the execution-payload (Execution Envelope) body a builder reveals per slot
 max_blobs_per_block = 10      # per-block blob budget; with blocks_in_blobs the payload-blobs
                              # share it (each carries ~124 KiB of payload), so it must be
                              # >= ceil(exec_payload_size_kib / 124). Default 6 if omitted.
@@ -38,11 +38,16 @@ blob_spammers = 0            # EL-only load generators that originate blobs
 peers_per_node = 50           # random CL (QUIC) peers each CL node dials (incl. proposer)
 el_peers_per_node = 50        # random EL (TCP) peers each node dials (incl. >=1 spammer)
 
-# Geo-realistic network. Each host is assigned a region and a bandwidth tier by
-# weight; inter-host latency comes from a fixed inter-region matrix + per-edge jitter.
+# Geo-realistic network. A seeded fraction of CL hosts are supernodes, which custody
+# all 128 data columns. Other CL hosts keep the default 8-column custody set. EL-only
+# blob spammers are always non-supernodes. Inter-host latency comes from a fixed
+# inter-region matrix + per-edge jitter.
 [network]
 jitter_ratio = 0.3           # +/- fraction applied per edge to the base geo latency
 packet_loss = 0.0            # per-link packet loss (0.0 - 1.0)
+supernode_fraction = 0.05    # fraction of CL hosts assigned as supernodes (0.0 - 1.0)
+supernode_bandwidth = "1 Gbit"
+non_supernode_bandwidth = "50 Mbit"
 
 [network.regions]            # region -> weight (probability a host lands there)
 us-east = 0.30
@@ -51,11 +56,6 @@ europe  = 0.25
 asia    = 0.20
 sa      = 0.05
 africa  = 0.05
-
-[network.bandwidths]         # bandwidth tier -> weight (applied to up and down)
-"1 Gbit"   = 0.05
-"100 Mbit" = 0.20
-"50 Mbit"  = 0.75
 
 [docker]
 # Base image that ships Shadow (arm64). Must be a build with the tcp_sendUserData
