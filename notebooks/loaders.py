@@ -9,7 +9,7 @@ normalises timestamps to a per-run epoch, joins the static topology artefacts
 (``regions.json`` / ``bandwidths.json`` / ``topology.gml`` / ``blobsim.toml``),
 and returns the frames the notebook sections consume:
 
-    traffic, arrivals, columns, pool, slots, nodes, meta
+    traffic, arrivals, columns, reconstructions, pool, slots, nodes, meta
 
 Frames for events a given run did not emit come back empty but *with their
 declared columns*, so downstream cells can filter without KeyErrors.
@@ -55,6 +55,11 @@ _TRAFFIC_COLS = [
     "recipients", "total_bytes", "new_cells", "estimated", "role_group",
 ]
 _POOL_COLS = ["node", "slot", "t_ms", "pending", "included"]
+_RECONSTRUCTION_COLS = [
+    "node", "event", "slot", "t_ms", "blob_index", "generation", "attempt",
+    "trigger", "cells_held", "complete_columns", "delay_ms", "cells_added", "columns_updated",
+    "outcome", "reason",
+]
 _NODES_COLS = [
     "node", "roles", "region", "bandwidth", "is_cl_node", "is_builder",
     "is_zk_attester", "is_validator", "is_spammer", "role_group", "num_custody_columns",
@@ -394,6 +399,12 @@ def load_run(run_dir: str | Path | None = None) -> dict[str, pd.DataFrame]:
     arrivals = _build_arrivals(events, nodes)
 
     columns = _select(events, {"column_complete", "custody_complete", "column_status"}, _COLUMNS_COLS)
+    reconstructions = _select(
+        events,
+        {"blob_reconstruction_started", "blob_reconstruction_completed",
+         "blob_reconstruction_dropped"},
+        _RECONSTRUCTION_COLS,
+    )
 
     # traffic events carry the message kind as `mkind` (the reserved `kind=` token
     # names the event type), so map it into the frame's `kind` column here.
@@ -432,6 +443,19 @@ def load_run(run_dir: str | Path | None = None) -> dict[str, pd.DataFrame]:
         "enable_partial_columns": sim.get("enable_partial_columns"),
         "disable_get_blobs": sim.get("disable_get_blobs"),
         "blocks_in_blobs": sim.get("blocks_in_blobs"),
+        "blob_reconstruction_delay_ms": run_meta.get(
+            "blob_reconstruction_delay_ms",
+            sim.get("blob_reconstruction_delay_ms", 100),
+        ),
+        "blob_reconstruction_trigger": run_meta.get(
+            "blob_reconstruction_trigger",
+            sim.get("blob_reconstruction_trigger", "complete-columns"),
+        ),
+        # New launcher runs record whether the seeded topology actually contains
+        # a non-builder reconstruction supernode. Older runs predate the feature.
+        "blob_reconstruction_enabled": run_meta.get(
+            "blob_reconstruction_enabled", False
+        ),
         "validators": top.get("validators"),
         "zk_attesters": top.get("zk_attesters"),
         "blob_spammers": top.get("blob_spammers"),
@@ -442,6 +466,7 @@ def load_run(run_dir: str | Path | None = None) -> dict[str, pd.DataFrame]:
         "traffic": traffic,
         "arrivals": arrivals,
         "columns": columns,
+        "reconstructions": reconstructions,
         "pool": pool,
         "slots": slots,
         "nodes": nodes,
@@ -470,7 +495,15 @@ def compare_run_meta(meta: pd.DataFrame, baseline_meta: pd.DataFrame) -> list[st
         return ["missing meta for comparison"]
     a, b = meta.iloc[0], baseline_meta.iloc[0]
     warnings = []
-    for key in ["seed", "slots", "blobs_per_slot", "exec_payload_size_kib", "validators"]:
+    keys = [
+        "seed", "slots", "blobs_per_slot", "exec_payload_size_kib", "validators",
+        "blob_reconstruction_enabled",
+    ]
+    if bool(a.get("blob_reconstruction_enabled")) and bool(
+        b.get("blob_reconstruction_enabled")
+    ):
+        keys += ["blob_reconstruction_trigger", "blob_reconstruction_delay_ms"]
+    for key in keys:
         if a.get(key) != b.get(key):
             warnings.append(f"{key} differs: run={a.get(key)} baseline={b.get(key)}")
     return warnings

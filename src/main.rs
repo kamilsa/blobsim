@@ -17,10 +17,11 @@ use crate::metrics::BandwidthMetrics;
 use crate::network::{
     all_column_subnets, build_swarm, dial_peers, subnet_for_column, subscribe_all,
 };
-use crate::state_machine::{run_blob_spammer, run_node};
+use crate::state_machine::{run_blob_spammer, run_node, BlobReconstructionConfig};
 use crate::types::{
-    custody_columns_for_seed, payload_blob_count, NodeRoles, Role, BLOBS_PER_SLOT,
-    CUSTODY_SUBSET_SIZE, EXEC_PAYLOAD_SIZE, MAX_BLOBS_PER_BLOCK, USABLE_BYTES_PER_BLOB,
+    custody_columns_for_seed, payload_blob_count, BlobReconstructionTrigger, NodeRoles, Role,
+    BLOBS_PER_SLOT, CUSTODY_SUBSET_SIZE, EXEC_PAYLOAD_SIZE, MAX_BLOBS_PER_BLOCK,
+    NUM_CUSTODY_COLUMNS, USABLE_BYTES_PER_BLOB,
 };
 
 use clap::Parser;
@@ -118,6 +119,55 @@ struct Cli {
     /// it must cover `ceil(exec_payload_size / 126976)`.
     #[arg(long = "max-blobs-per-block", default_value_t = MAX_BLOBS_PER_BLOCK)]
     max_blobs_per_block: usize,
+
+    /// Internal launcher capability flag: reconstruct missing blob cells after
+    /// the configured eligibility gate. Intended for non-builder supernodes.
+    #[arg(long = "enable-blob-reconstruction", default_value_t = false)]
+    enable_blob_reconstruction: bool,
+
+    /// Artificial parallel reconstruction latency in milliseconds (zero is valid).
+    #[arg(long = "blob-reconstruction-delay-ms", default_value_t = 100)]
+    blob_reconstruction_delay_ms: u64,
+
+    /// Eligibility policy: complete-columns or per-row.
+    #[arg(long = "blob-reconstruction-trigger", default_value_t = BlobReconstructionTrigger::default())]
+    blob_reconstruction_trigger: BlobReconstructionTrigger,
+}
+
+fn validate_cli(cli: &Cli, roles: &NodeRoles) -> Result<Option<BlobReconstructionConfig>, String> {
+    if cli.blocks_in_blobs {
+        let n_payload = payload_blob_count(cli.exec_payload_size);
+        if n_payload > cli.max_blobs_per_block {
+            return Err(format!(
+                "--blocks-in-blobs execution payload of {} bytes needs {} payload-blobs, \
+                 exceeding --max-blobs-per-block ({}). Reduce --exec-payload-size to at most {} \
+                 bytes or raise --max-blobs-per-block.",
+                cli.exec_payload_size,
+                n_payload,
+                cli.max_blobs_per_block,
+                cli.max_blobs_per_block * USABLE_BYTES_PER_BLOB,
+            ));
+        }
+    }
+    if !cli.enable_blob_reconstruction {
+        return Ok(None);
+    }
+    if !(cli.enable_partial_columns || cli.blocks_in_blobs) {
+        return Err("--enable-blob-reconstruction requires effective partial columns".into());
+    }
+    if cli.custody_columns < NUM_CUSTODY_COLUMNS as usize {
+        return Err(format!(
+            "--enable-blob-reconstruction requires --custody-columns at least {}",
+            NUM_CUSTODY_COLUMNS
+        ));
+    }
+    if roles.is_builder() || roles.is_proposer() || roles.is_blob_spammer() {
+        return Err("--enable-blob-reconstruction is only valid for non-builder CL roles".into());
+    }
+    Ok(Some(BlobReconstructionConfig {
+        delay: tokio::time::Duration::from_millis(cli.blob_reconstruction_delay_ms),
+        trigger: cli.blob_reconstruction_trigger,
+    }))
 }
 
 // A single-threaded (current-thread) runtime: under Shadow every guest thread is
@@ -136,25 +186,10 @@ async fn main() {
 
     let cli = Cli::parse();
     let roles = NodeRoles::from_roles(&cli.roles);
-
-    // Payload-blobs share the per-block blob budget with EL blobs (EIP-8142), so an
-    // execution payload that needs more than the budget's payload-blobs cannot
-    // fit — reject it rather than silently publishing an over-budget block.
-    if cli.blocks_in_blobs {
-        let n_payload = payload_blob_count(cli.exec_payload_size);
-        if n_payload > cli.max_blobs_per_block {
-            eprintln!(
-                "error: --blocks-in-blobs execution payload of {} bytes needs {} payload-blobs, \
-                 exceeding --max-blobs-per-block ({}). Reduce --exec-payload-size to at most {} \
-                 bytes or raise --max-blobs-per-block.",
-                cli.exec_payload_size,
-                n_payload,
-                cli.max_blobs_per_block,
-                cli.max_blobs_per_block * USABLE_BYTES_PER_BLOB,
-            );
-            std::process::exit(1);
-        }
-    }
+    let reconstruction = validate_cli(&cli, &roles).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
 
     info!(
         roles = %roles,
@@ -252,6 +287,92 @@ async fn main() {
         cli.blocks_in_blobs,
         cli.custody_columns,
         cli.max_blobs_per_block,
+        reconstruction,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstruction_cli_defaults_are_stable() {
+        let cli = Cli::try_parse_from(["blob-sim", "--role", "validator"]).unwrap();
+        assert!(!cli.enable_blob_reconstruction);
+        assert_eq!(cli.blob_reconstruction_delay_ms, 100);
+        assert_eq!(
+            cli.blob_reconstruction_trigger,
+            BlobReconstructionTrigger::CompleteColumns
+        );
+        assert!(validate_cli(&cli, &NodeRoles::from_roles(&cli.roles))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn per_row_and_zero_delay_validate_for_partial_supernode() {
+        let cli = Cli::try_parse_from([
+            "blob-sim",
+            "--role",
+            "validator",
+            "--enable-partial-columns",
+            "--custody-columns",
+            "129",
+            "--enable-blob-reconstruction",
+            "--blob-reconstruction-delay-ms",
+            "0",
+            "--blob-reconstruction-trigger",
+            "per-row",
+        ])
+        .unwrap();
+        let config = validate_cli(&cli, &NodeRoles::from_roles(&cli.roles))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.delay, tokio::time::Duration::ZERO);
+        assert_eq!(config.trigger, BlobReconstructionTrigger::PerRow);
+    }
+
+    #[test]
+    fn invalid_reconstruction_combinations_are_rejected() {
+        let no_partials = Cli::try_parse_from([
+            "blob-sim",
+            "--role",
+            "validator",
+            "--custody-columns",
+            "128",
+            "--enable-blob-reconstruction",
+        ])
+        .unwrap();
+        assert!(validate_cli(&no_partials, &NodeRoles::from_roles(&no_partials.roles)).is_err());
+
+        let builder = Cli::try_parse_from([
+            "blob-sim",
+            "--role",
+            "builder",
+            "--enable-partial-columns",
+            "--custody-columns",
+            "128",
+            "--enable-blob-reconstruction",
+        ])
+        .unwrap();
+        assert!(validate_cli(&builder, &NodeRoles::from_roles(&builder.roles)).is_err());
+
+        assert!(Cli::try_parse_from([
+            "blob-sim",
+            "--role",
+            "validator",
+            "--blob-reconstruction-trigger",
+            "other",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "blob-sim",
+            "--role",
+            "validator",
+            "--blob-reconstruction-delay-ms",
+            "-1",
+        ])
+        .is_err());
+    }
 }

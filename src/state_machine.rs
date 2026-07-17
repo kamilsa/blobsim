@@ -14,8 +14,8 @@ use crate::network::{
     TOPIC_CL_BLOB_SIDECAR, TOPIC_CL_PAYLOAD_ENVELOPE,
 };
 use crate::partial::{
-    OutgoingPartialColumn, PartialColumnAssembler, PartialColumnHeaderTracker,
-    PARTIAL_COLUMNS_VERSION_BYTE,
+    EligibleRows, OutgoingPartialColumn, PartialColumnAssembler, PartialColumnHeaderTracker,
+    ReconstructionApply, PARTIAL_COLUMNS_VERSION_BYTE,
 };
 use crate::types::*;
 
@@ -26,7 +26,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -46,6 +46,25 @@ const INCLUDED_WINDOW_SLOTS: u64 = 4;
 /// Per-announced-blob probability that a non-builder CL node fetches custody
 /// cells instead of the full payload.
 const SAMPLER_FETCH_PROBABILITY: f64 = 0.85;
+/// Hard ceiling on blob rows waiting for delayed reconstruction. Normal runs
+/// stay far below this; the bound protects extreme delays or malformed blocks.
+const MAX_SCHEDULED_RECONSTRUCTION_ROWS: usize = ASSEMBLER_CAPACITY * 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobReconstructionConfig {
+    pub delay: Duration,
+    pub trigger: BlobReconstructionTrigger,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledReconstruction {
+    block_root: [u8; 32],
+    generation: u64,
+    attempt: u64,
+    trigger: BlobReconstructionTrigger,
+    rows: Vec<usize>,
+    ready_at: Instant,
+}
 
 /// A pooled entry for one announced blob hash: either the full blob, or a sparse
 /// set of custody cells (column index → 2 KiB cell).
@@ -254,10 +273,19 @@ struct PartialState {
     /// Slots for which a `custody_complete` event has already been emitted, so the
     /// §4 completion transition fires at most once per slot.
     custody_complete_slots: HashSet<u64>,
+    reconstruction: Option<BlobReconstructionConfig>,
+    scheduled_reconstructions: Vec<ScheduledReconstruction>,
+    next_reconstruction_attempt: u64,
 }
 
 impl PartialState {
-    fn new(enabled: bool, get_blobs_enabled: bool, seed: u64, custody_columns: usize) -> Self {
+    fn new(
+        enabled: bool,
+        get_blobs_enabled: bool,
+        seed: u64,
+        custody_columns: usize,
+        reconstruction: Option<BlobReconstructionConfig>,
+    ) -> Self {
         Self {
             enabled,
             get_blobs_enabled,
@@ -266,6 +294,108 @@ impl PartialState {
             header_tracker: PartialColumnHeaderTracker::new(HEADER_TRACKER_CAPACITY),
             custody_advertised_blocks: HashSet::new(),
             custody_complete_slots: HashSet::new(),
+            reconstruction,
+            scheduled_reconstructions: Vec::new(),
+            next_reconstruction_attempt: 1,
+        }
+    }
+
+    fn schedule_eligible(&mut self, block_root: [u8; 32]) {
+        let Some(config) = self.reconstruction else {
+            return;
+        };
+        let Some(batch) = self
+            .assembler
+            .take_eligible_rows(block_root, config.trigger)
+        else {
+            return;
+        };
+        self.schedule_batch(batch, config);
+    }
+
+    fn schedule_batch(&mut self, mut batch: EligibleRows, config: BlobReconstructionConfig) {
+        let attempt = self.next_reconstruction_attempt;
+        self.next_reconstruction_attempt = self.next_reconstruction_attempt.wrapping_add(1).max(1);
+        let queued_rows: usize = self
+            .scheduled_reconstructions
+            .iter()
+            .map(|scheduled| scheduled.rows.len())
+            .sum();
+        let available = MAX_SCHEDULED_RECONSTRUCTION_ROWS.saturating_sub(queued_rows);
+        let dropped = batch.rows.split_off(batch.rows.len().min(available));
+        if !dropped.is_empty() {
+            let rows: Vec<usize> = dropped.iter().map(|(row, _)| *row).collect();
+            self.assembler
+                .release_reconstructing(batch.block_root, batch.generation, &rows);
+            for row in rows {
+                event!(
+                    "blob_reconstruction_dropped",
+                    slot_for_block_root(&batch.block_root),
+                    blob_index = row,
+                    generation = batch.generation,
+                    attempt = attempt,
+                    trigger = batch.trigger,
+                    reason = "queue-capacity"
+                );
+            }
+        }
+        if batch.rows.is_empty() {
+            return;
+        }
+
+        let start = Instant::now();
+        for &(blob_index, cells_held) in &batch.rows {
+            event!(
+                "blob_reconstruction_started",
+                slot_for_block_root(&batch.block_root),
+                blob_index = blob_index,
+                generation = batch.generation,
+                attempt = attempt,
+                trigger = batch.trigger,
+                cells_held = cells_held,
+                complete_columns = batch.complete_columns,
+                delay_ms = config.delay.as_millis()
+            );
+        }
+        self.scheduled_reconstructions
+            .push(ScheduledReconstruction {
+                block_root: batch.block_root,
+                generation: batch.generation,
+                attempt,
+                trigger: batch.trigger,
+                rows: batch.rows.into_iter().map(|(row, _)| row).collect(),
+                ready_at: start + config.delay,
+            });
+        self.scheduled_reconstructions.sort_by_key(|batch| {
+            (
+                batch.ready_at,
+                batch.block_root,
+                batch.generation,
+                batch.attempt,
+                batch.rows.first().copied().unwrap_or(0),
+            )
+        });
+    }
+
+    fn retry_eligible(&mut self) {
+        for block_root in self.assembler.blocks_with_header() {
+            self.schedule_eligible(block_root);
+        }
+    }
+
+    fn drop_pending_reconstructions(&mut self, reason: &'static str) {
+        for batch in self.scheduled_reconstructions.drain(..) {
+            for blob_index in batch.rows {
+                event!(
+                    "blob_reconstruction_dropped",
+                    slot_for_block_root(&batch.block_root),
+                    blob_index = blob_index,
+                    generation = batch.generation,
+                    attempt = batch.attempt,
+                    trigger = batch.trigger,
+                    reason = reason
+                );
+            }
         }
     }
 }
@@ -301,6 +431,7 @@ pub async fn run_node(
     blocks_in_blobs: bool,
     custody_columns: usize,
     max_blobs_per_block: usize,
+    reconstruction: Option<BlobReconstructionConfig>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let node_index = seed; // use seed as a simple unique index for this node
@@ -311,8 +442,13 @@ pub async fn run_node(
 
     // Partial data-column state (gossipsub 1.3 cell-level deltas). Inert unless
     // `--enable-partial-columns` is set.
-    let mut partial_state =
-        PartialState::new(enable_partial_columns, !disable_get_blobs, seed, custody_columns);
+    let mut partial_state = PartialState::new(
+        enable_partial_columns,
+        !disable_get_blobs,
+        seed,
+        custody_columns,
+        reconstruction,
+    );
 
     // Full blobs this node's EL receives over EL networking. Builders drain it
     // to assemble a block's blob set; partial-column nodes read it via the
@@ -335,15 +471,12 @@ pub async fn run_node(
         // payload-blobs whose commitments come first in the block. These blobs are
         // generated locally by the builder and never announced over EL, so peers
         // cannot pre-fill their cells from the EL blob pool.
-        let execution_payload = if roles.is_builder() {
-            random_bytes(&mut rng, exec_payload_size)
+        let (execution_payload, payload_blobs) = if blocks_in_blobs && roles.is_builder() {
+            recoverable_payload_blobs(exec_payload_size, &mut rng)
+        } else if roles.is_builder() {
+            (random_bytes(&mut rng, exec_payload_size), Vec::new())
         } else {
-            Vec::new()
-        };
-        let payload_blobs = if blocks_in_blobs && roles.is_builder() {
-            encode_payload_blobs(&execution_payload, &mut rng)
-        } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let n_payload = payload_blobs.len();
 
@@ -362,12 +495,7 @@ pub async fn run_node(
         // random hash that no peer has seen over EL.
         let mut block_blobs: Vec<([u8; 32], Vec<u8>)> =
             Vec::with_capacity(n_payload + el_blobs.len());
-        for blob in payload_blobs {
-            let hash: [u8; 32] = random_bytes(&mut rng, 32)
-                .try_into()
-                .expect("32 random bytes");
-            block_blobs.push((hash, blob));
-        }
+        block_blobs.extend(payload_blobs);
         block_blobs.extend(el_blobs);
 
         // Commitments naming exactly the block blobs, shared by the t=0 proposal
@@ -605,9 +733,18 @@ pub async fn run_node(
         metrics.emit_slot_summary(slot);
 
         let cl_peers = swarm.connected_peers().count();
-        event!("slot_end", slot, cl_peers = cl_peers, el_peers = el_peer_count);
+        event!(
+            "slot_end",
+            slot,
+            cl_peers = cl_peers,
+            el_peers = el_peer_count
+        );
         info!(slot, "=== SLOT END ===");
     }
+
+    // Jobs whose deadlines extend past the configured simulation window are
+    // explicitly right-censored rather than left as unmatched start events.
+    partial_state.drop_pending_reconstructions("simulation-ended");
 
     // Emit end-of-simulation summary
     metrics.emit_final_summary(num_slots);
@@ -646,7 +783,7 @@ pub async fn run_blob_spammer(
     let mut el_peer_count: usize = 0;
     // Blob-spammers are EL-only: partial columns are disabled and they are not
     // builders, so the shared EL handler never pools blobs for them.
-    let partial_state = PartialState::new(false, true, seed, CUSTODY_SUBSET_SIZE);
+    let partial_state = PartialState::new(false, true, seed, CUSTODY_SUBSET_SIZE, None);
     let mut el_blob_pool = ElBlobPool::default();
 
     info!(%roles, num_slots, blobs_per_slot, node_id, "starting blob-spammer");
@@ -743,10 +880,21 @@ async fn drain_events_until(
     el_blob_pool: &mut ElBlobPool,
 ) {
     loop {
+        let now = Instant::now();
+        let due_by = if now < deadline { now } else { deadline };
+        if process_due_reconstructions(swarm, partial_state, metrics, due_by) {
+            partial_state.retry_eligible();
+        }
+        if now >= deadline {
+            break;
+        }
+        let wake_at = partial_state
+            .scheduled_reconstructions
+            .first()
+            .map(|batch| batch.ready_at.min(deadline))
+            .unwrap_or(deadline);
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
-                break;
-            }
+            _ = tokio::time::sleep_until(wake_at) => {}
             event = swarm.select_next_some() => {
                 handle_swarm_event(swarm, roles, event, metrics, partial_state, el_blob_pool);
             }
@@ -765,6 +913,93 @@ async fn drain_events_until(
             }
         }
     }
+}
+
+/// Apply all jobs due at this wake, then publish each changed column once.
+fn process_due_reconstructions(
+    swarm: &mut Swarm<SimBehaviour>,
+    partial_state: &mut PartialState,
+    metrics: &mut BandwidthMetrics,
+    due_by: Instant,
+) -> bool {
+    let due_count = partial_state
+        .scheduled_reconstructions
+        .iter()
+        .take_while(|batch| batch.ready_at <= due_by)
+        .count();
+    if due_count == 0 {
+        return false;
+    }
+    let due: Vec<_> = partial_state
+        .scheduled_reconstructions
+        .drain(..due_count)
+        .collect();
+    let mut changed_by_block: BTreeMap<[u8; 32], HashSet<u64>> = BTreeMap::new();
+    let mut affected_blocks = BTreeSet::new();
+    for batch in due {
+        let slot = slot_for_block_root(&batch.block_root);
+        match partial_state.assembler.apply_reconstruction(
+            batch.block_root,
+            batch.generation,
+            &batch.rows,
+        ) {
+            ReconstructionApply::Stale => {
+                for blob_index in batch.rows {
+                    event!(
+                        "blob_reconstruction_dropped",
+                        slot,
+                        blob_index = blob_index,
+                        generation = batch.generation,
+                        attempt = batch.attempt,
+                        trigger = batch.trigger,
+                        reason = "assembly-evicted"
+                    );
+                }
+            }
+            ReconstructionApply::Applied {
+                rows,
+                changed_columns,
+                newly_complete_columns,
+            } => {
+                for _ in 0..newly_complete_columns {
+                    metrics.record_partial_column_completed();
+                }
+                for row in rows {
+                    event!(
+                        "blob_reconstruction_completed",
+                        slot,
+                        blob_index = row.blob_index,
+                        generation = batch.generation,
+                        attempt = batch.attempt,
+                        trigger = batch.trigger,
+                        cells_added = row.cells_added,
+                        columns_updated = row.columns_updated,
+                        outcome = if row.already_complete {
+                            "already-complete"
+                        } else {
+                            "reconstructed"
+                        }
+                    );
+                }
+                changed_by_block
+                    .entry(batch.block_root)
+                    .or_default()
+                    .extend(changed_columns);
+                affected_blocks.insert(batch.block_root);
+            }
+        }
+    }
+    for (block_root, columns) in changed_by_block {
+        let mut columns: Vec<_> = columns.into_iter().collect();
+        columns.sort_unstable();
+        for column in columns {
+            republish_partial_column(swarm, partial_state, block_root, column, metrics);
+        }
+    }
+    for block_root in affected_blocks {
+        maybe_emit_custody_complete(partial_state, block_root);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +1133,10 @@ fn handle_swarm_event(
                                     metrics,
                                 );
                             }
+                            // Always check the just-merged partial itself. The
+                            // custody helper can return early when there is no EL
+                            // data to fold in, including on a header refresh.
+                            partial_state.schedule_eligible(column.block_root);
                             // Re-publish our accumulated cells so we can serve them
                             // to other mesh peers (multi-hop cell-delta cross-fill).
                             // Also re-publish when the sender's metadata shows state
@@ -952,7 +1191,13 @@ fn handle_swarm_event(
                             subnet,
                             metadata.as_deref(),
                         ) {
-                            republish_partial_column(swarm, partial_state, block_root, subnet, metrics);
+                            republish_partial_column(
+                                swarm,
+                                partial_state,
+                                block_root,
+                                subnet,
+                                metrics,
+                            );
                         }
                     }
                 }
@@ -1507,6 +1752,7 @@ fn ensure_custody_columns(
     }
 
     // getBlobs may have just completed our full custody set before any CL seeding (§4).
+    partial_state.schedule_eligible(block_root);
     maybe_emit_custody_complete(partial_state, block_root);
 }
 
@@ -1612,10 +1858,18 @@ fn block_root_from_group_id(group_id: &[u8]) -> Option<[u8; 32]> {
 /// column index comes from the topic's subnet (1:1 under Fulu); the block root
 /// comes from the group id (`0x00 || block_root`).
 fn decode_partial(subnet: u64, group_id: &[u8], data: &[u8]) -> Result<PartialDataColumn, String> {
-    let block_root = block_root_from_group_id(group_id)
-        .ok_or_else(|| format!("bad group id (len {}): {:?}", group_id.len(), group_id.first()))?;
+    let block_root = block_root_from_group_id(group_id).ok_or_else(|| {
+        format!(
+            "bad group id (len {}): {:?}",
+            group_id.len(),
+            group_id.first()
+        )
+    })?;
     let sidecar =
         PartialDataColumnSidecar::decode(data).map_err(|e| format!("decode sidecar: {e}"))?;
+    if !sidecar.is_structurally_valid() {
+        return Err("invalid sidecar bitmap/cell/proof structure".into());
+    }
     Ok(PartialDataColumn {
         block_root,
         index: subnet,
@@ -1817,7 +2071,7 @@ mod tests {
     /// A partial-enabled state holding cells `held` (of `len` blob slots) for
     /// (block `h(1)`, column 0).
     fn state_with_cells(len: usize, held: &[usize]) -> PartialState {
-        let mut state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE);
+        let mut state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE, None);
         let sidecar = PartialDataColumnSidecar {
             cells_present_bitmap: bitmap(len, held),
             column: held.iter().map(|_| vec![0xAA; BYTES_PER_CELL]).collect(),
@@ -1871,7 +2125,7 @@ mod tests {
     #[test]
     fn repair_needed_for_unknown_column_when_peer_has_cells() {
         // No local cells at all for the block: any advertised cell is one we lack.
-        let state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE);
+        let state = PartialState::new(true, true, 7, CUSTODY_SUBSET_SIZE, None);
         let peer = meta(6, &[0, 1], &[0, 1]);
         assert!(partial_repair_needed(&state, &h(9), 0, Some(&peer)));
     }
@@ -1885,6 +2139,19 @@ mod tests {
         let mut bad_version = group_id.clone();
         bad_version[0] = 0x01;
         assert_eq!(block_root_from_group_id(&bad_version), None);
+    }
+
+    #[test]
+    fn decode_partial_rejects_inconsistent_sparse_vectors() {
+        let mut group_id = vec![PARTIAL_COLUMNS_VERSION_BYTE];
+        group_id.extend_from_slice(&h(6));
+        let malformed = PartialDataColumnSidecar {
+            cells_present_bitmap: bitmap(1, &[0]),
+            column: Vec::new(),
+            kzg_proofs: Vec::new(),
+            header: None,
+        };
+        assert!(decode_partial(0, &group_id, &malformed.encode()).is_err());
     }
 
     // -- Partial (custody-cell) blob data --
@@ -1994,5 +2261,144 @@ mod tests {
             pool.get_cells(&hash, &[42])[0].as_deref(),
             Some(&served[..])
         );
+    }
+
+    #[test]
+    fn reconstruction_batches_use_one_parallel_deadline_and_overlap() {
+        let config = BlobReconstructionConfig {
+            delay: Duration::from_secs(10),
+            trigger: BlobReconstructionTrigger::PerRow,
+        };
+        let mut state = PartialState::new(true, true, 7, 128, Some(config));
+        state.schedule_batch(
+            EligibleRows {
+                block_root: h(1),
+                generation: 1,
+                trigger: config.trigger,
+                complete_columns: 0,
+                rows: vec![(0, 64), (1, 64), (2, 64)],
+            },
+            config,
+        );
+        assert_eq!(state.scheduled_reconstructions.len(), 1);
+        assert_eq!(state.scheduled_reconstructions[0].rows, vec![0, 1, 2]);
+        let first_deadline = state.scheduled_reconstructions[0].ready_at;
+
+        state.schedule_batch(
+            EligibleRows {
+                block_root: h(2),
+                generation: 2,
+                trigger: config.trigger,
+                complete_columns: 0,
+                rows: vec![(3, 64)],
+            },
+            config,
+        );
+        let second_deadline = state
+            .scheduled_reconstructions
+            .iter()
+            .find(|batch| batch.block_root == h(2))
+            .unwrap()
+            .ready_at;
+        assert!(second_deadline >= first_deadline);
+        assert!(second_deadline.duration_since(first_deadline) < config.delay);
+    }
+
+    #[test]
+    fn zero_delay_is_immediately_due_and_disabled_state_has_no_config() {
+        let config = BlobReconstructionConfig {
+            delay: Duration::ZERO,
+            trigger: BlobReconstructionTrigger::CompleteColumns,
+        };
+        let mut state = PartialState::new(true, true, 7, 128, Some(config));
+        state.schedule_batch(
+            EligibleRows {
+                block_root: h(3),
+                generation: 3,
+                trigger: config.trigger,
+                complete_columns: 64,
+                rows: vec![(0, 64)],
+            },
+            config,
+        );
+        assert!(state.scheduled_reconstructions[0].ready_at <= Instant::now());
+
+        let disabled = PartialState::new(false, true, 7, 128, None);
+        assert!(disabled.reconstruction.is_none());
+        assert!(disabled.scheduled_reconstructions.is_empty());
+    }
+
+    #[test]
+    fn queue_capacity_bounds_total_rows_not_batches() {
+        let config = BlobReconstructionConfig {
+            delay: Duration::from_secs(10),
+            trigger: BlobReconstructionTrigger::PerRow,
+        };
+        let mut state = PartialState::new(true, true, 7, 128, Some(config));
+        // Fill the queue to one row below capacity.
+        let near_full: Vec<(usize, usize)> = (0..MAX_SCHEDULED_RECONSTRUCTION_ROWS - 1)
+            .map(|r| (r, 64))
+            .collect();
+        state.schedule_batch(
+            EligibleRows {
+                block_root: h(1),
+                generation: 1,
+                trigger: config.trigger,
+                complete_columns: 0,
+                rows: near_full,
+            },
+            config,
+        );
+        // A 3-row batch has room for only 1 row; the other 2 are dropped.
+        state.schedule_batch(
+            EligibleRows {
+                block_root: h(2),
+                generation: 2,
+                trigger: config.trigger,
+                complete_columns: 0,
+                rows: vec![(0, 64), (1, 64), (2, 64)],
+            },
+            config,
+        );
+        let queued: usize = state
+            .scheduled_reconstructions
+            .iter()
+            .map(|batch| batch.rows.len())
+            .sum();
+        assert_eq!(queued, MAX_SCHEDULED_RECONSTRUCTION_ROWS);
+        let second = state
+            .scheduled_reconstructions
+            .iter()
+            .find(|batch| batch.block_root == h(2))
+            .expect("second batch keeps its admitted row");
+        assert_eq!(second.rows, vec![0]);
+    }
+
+    #[test]
+    fn attempts_are_unique_per_scheduled_batch() {
+        let config = BlobReconstructionConfig {
+            delay: Duration::from_secs(1),
+            trigger: BlobReconstructionTrigger::PerRow,
+        };
+        let mut state = PartialState::new(true, true, 7, 128, Some(config));
+        for (gen, row) in [(1u64, 0usize), (2, 1)] {
+            state.schedule_batch(
+                EligibleRows {
+                    block_root: h(gen as u8),
+                    generation: gen,
+                    trigger: config.trigger,
+                    complete_columns: 0,
+                    rows: vec![(row, 64)],
+                },
+                config,
+            );
+        }
+        let attempts: Vec<u64> = state
+            .scheduled_reconstructions
+            .iter()
+            .map(|batch| batch.attempt)
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0], attempts[1]);
     }
 }

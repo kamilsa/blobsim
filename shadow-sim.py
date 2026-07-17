@@ -59,6 +59,10 @@ BLOB_SIM_BIN_NATIVE = str(REPO_ROOT / "target" / "release" / "blob-sim")
 USABLE_BYTES_PER_BLOB = 126_976   # 4096 field elements x 31 usable bytes
 MAX_BLOBS_PER_BLOCK = 6           # default per-block blob budget
 NUM_CUSTODY_COLUMNS = 128         # full custody set for supernodes
+DEFAULT_RECONSTRUCTION_ENABLED = True
+DEFAULT_RECONSTRUCTION_DELAY_MS = 100
+DEFAULT_RECONSTRUCTION_TRIGGER = "complete-columns"
+RECONSTRUCTION_TRIGGERS = {"complete-columns", "per-row"}
 
 # Inter-region round-trip latencies in milliseconds, ported verbatim from
 # lean-shadow-fuzzer/shadow_fuzzer/generate_shadow_topology.py.
@@ -79,6 +83,21 @@ def log(msg: str) -> None:
 def die(msg: str) -> None:
     print(f"[shadow-sim] error: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def reconstruction_settings(sim: dict) -> tuple[bool, int, str]:
+    """Parse and validate the reconstruction knobs in one place."""
+    enabled = sim.get("enable_blob_reconstruction", DEFAULT_RECONSTRUCTION_ENABLED)
+    if not isinstance(enabled, bool):
+        die("[sim].enable_blob_reconstruction must be true or false")
+    delay = sim.get("blob_reconstruction_delay_ms", DEFAULT_RECONSTRUCTION_DELAY_MS)
+    if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
+        die("[sim].blob_reconstruction_delay_ms must be a non-negative integer")
+    trigger = sim.get("blob_reconstruction_trigger", DEFAULT_RECONSTRUCTION_TRIGGER)
+    if not isinstance(trigger, str) or trigger not in RECONSTRUCTION_TRIGGERS:
+        accepted = ", ".join(sorted(RECONSTRUCTION_TRIGGERS))
+        die(f"[sim].blob_reconstruction_trigger must be one of: {accepted}")
+    return enabled, delay, trigger
 
 
 # ── Node model ───────────────────────────────────────────────────────────────
@@ -285,6 +304,13 @@ def build_args(node: Node, cfg: dict, cl_peers: list[str], el_peers: list[str]) 
             parts.append("--blocks-in-blobs")
         if node.is_supernode:
             parts += ["--custody-columns", str(NUM_CUSTODY_COLUMNS)]
+            effective_partial = bool(sim.get("enable_partial_columns") or
+                                     sim.get("blocks_in_blobs"))
+            enabled, delay, trigger = reconstruction_settings(sim)
+            if enabled and effective_partial and "builder" not in node.roles:
+                parts += ["--enable-blob-reconstruction",
+                          "--blob-reconstruction-delay-ms", str(delay),
+                          "--blob-reconstruction-trigger", trigger]
 
     parts += ["--seed", str(seed), "--slots", str(slots)]
     for p in cl_peers:
@@ -586,10 +612,10 @@ def _serve_forever() -> None:
         pass
 
 
-def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int:
-    """Generate topology.gml, regions/bandwidths.json and shadow.yaml for one run at
-    `seed`. Mutates `cfg["sim"]["seed"]` so the per-node `--seed` (build_args) matches
-    this run. Returns the host count."""
+def _generate_run(cfg: dict, out_dir: Path, seed: int,
+                  blob_sim_bin: str) -> tuple[int, bool]:
+    """Generate one run's topology/config and return host count plus whether at
+    least one non-builder supernode has reconstruction enabled."""
     cfg["sim"]["seed"] = seed
     net = cfg["network"]
     jitter_ratio = float(net.get("jitter_ratio", 0.3))
@@ -616,6 +642,12 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int
     geo_rng = random.Random(seed)
     regions = weighted_assign(region_weights, n, geo_rng)
     supernode_count = assign_supernodes(nodes, supernode_fraction, geo_rng)
+    reconstruction_requested, _, _ = reconstruction_settings(cfg["sim"])
+    effective_partial = bool(cfg["sim"].get("enable_partial_columns") or
+                             cfg["sim"].get("blocks_in_blobs"))
+    reconstruction_enabled = reconstruction_requested and effective_partial and any(
+        node.is_supernode and "builder" not in node.roles for node in nodes
+    )
     for node, region in zip(nodes, regions):
         node.region = region
         node.bandwidth = (supernode_bandwidth if node.is_supernode
@@ -643,7 +675,7 @@ def _generate_run(cfg: dict, out_dir: Path, seed: int, blob_sim_bin: str) -> int
     log(f"  {n} hosts: 1 proposer+builder, {validators} validators "
         f"(of which {zk_attesters} zk-attesters), {spammers} spammers; "
         f"{supernode_count} supernodes; regions {region_counts}")
-    return n
+    return n, reconstruction_enabled
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -679,6 +711,7 @@ def main() -> None:
     # startup check in src/main.rs) — otherwise every host exits and the run dies
     # with the error buried in a per-host stderr log.
     sim_cfg = cfg.get("sim", {})
+    _, reconstruction_delay_ms, reconstruction_trigger = reconstruction_settings(sim_cfg)
     if sim_cfg.get("blocks_in_blobs"):
         payload_bytes = int(sim_cfg.get("exec_payload_size_kib", 128)) * 1024
         budget = int(sim_cfg.get("max_blobs_per_block", MAX_BLOBS_PER_BLOCK))
@@ -755,7 +788,9 @@ def main() -> None:
         run_seed = base_seed + run_index
         if runs > 1:
             log(f"─── run {run_index + 1}/{runs}  (seed {run_seed}) ───")
-        _generate_run(cfg, out_dir, run_seed, blob_sim_bin)
+        _, reconstruction_enabled = _generate_run(
+            cfg, out_dir, run_seed, blob_sim_bin
+        )
         log(f"  runner: {runner}")
 
         if args.dry_run:
@@ -770,7 +805,11 @@ def main() -> None:
             native_run_shadow(out_dir)
 
         (out_dir / "run-meta.json").write_text(json.dumps(
-            {"seed": run_seed, "run_index": run_index, "runs": runs}, indent=2))
+            {"seed": run_seed, "run_index": run_index, "runs": runs,
+             "blob_reconstruction_delay_ms": reconstruction_delay_ms,
+             "blob_reconstruction_trigger": reconstruction_trigger,
+             "blob_reconstruction_enabled": reconstruction_enabled},
+            indent=2))
         summarize(out_dir)
 
         if args.serve:

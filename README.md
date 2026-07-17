@@ -134,9 +134,16 @@ different file as the positional argument; the launcher itself only takes `--dry
 - `[topology]` — `validators`, `zk_attesters` (how many validators are zk-attesters, EIP-8142), `blob_spammers`, and how many CL/EL peers each node dials.
 - `[network]` — a **geo-realistic** model: each host is assigned a region, while
   `supernode_fraction` selects an exact seeded fraction of CL hosts that custody all
-  128 columns. Set `supernode_bandwidth` and `non_supernode_bandwidth` independently;
-  inter-host latency comes from an inter-region matrix + per-edge jitter.
-- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`, `enable_partial_columns`, `disable_get_blobs`, `blocks_in_blobs` (EIP-8142; also propagate the payload as payload-blobs over the column subnets, implies `enable_partial_columns`), `rust_log`.
+  128 columns. With effective partial columns and `enable_blob_reconstruction`,
+  the launcher also enables mock reconstruction on selected non-builder supernodes.
+  Set `supernode_bandwidth` and `non_supernode_bandwidth` independently; inter-host
+  latency comes from an inter-region matrix + per-edge jitter.
+- `[sim]` — `slots`, `seed`, `blobs_per_slot`, `exec_payload_size_kib`,
+  `enable_partial_columns`, `disable_get_blobs`, `blocks_in_blobs` (EIP-8142;
+  also propagate the payload as payload-blobs over the column subnets, implies
+  `enable_partial_columns`), `enable_blob_reconstruction` (default `true`),
+  `blob_reconstruction_delay_ms` (default 100), `blob_reconstruction_trigger`
+  (`complete-columns` or `per-row`), `rust_log`.
 
 The whole topology is deterministic in `[sim].seed`: same config → byte-identical
 `shadow.yaml`/`topology.gml`.

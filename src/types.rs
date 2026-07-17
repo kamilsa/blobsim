@@ -11,6 +11,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 
+/// Policy used to decide when enough cells are available to reconstruct blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BlobReconstructionTrigger {
+    /// Start all incomplete blob rows after 64 complete vertical columns exist.
+    #[default]
+    CompleteColumns,
+    /// Start each blob row independently once it holds 64 distinct cells.
+    PerRow,
+}
+
+impl fmt::Display for BlobReconstructionTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CompleteColumns => "complete-columns",
+            Self::PerRow => "per-row",
+        })
+    }
+}
+
+impl std::str::FromStr for BlobReconstructionTrigger {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "complete-columns" => Ok(Self::CompleteColumns),
+            "per-row" => Ok(Self::PerRow),
+            other => Err(format!(
+                "invalid reconstruction trigger '{other}'; expected complete-columns or per-row"
+            )),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Node roles
 // ---------------------------------------------------------------------------
@@ -391,20 +424,31 @@ pub fn payload_blob_count(exec_payload_size: usize) -> usize {
     exec_payload_size.div_ceil(USABLE_BYTES_PER_BLOB)
 }
 
-/// Encode an execution payload into full blob bodies for blocks-in-blobs.
-///
-/// The first [`USABLE_BYTES_PER_BLOB`] bytes of each blob carry payload bytes;
-/// all remaining bytes are seeded random padding so compression-sensitive runs do
-/// not see unrealistic zero/repeated-byte bodies.
-pub fn encode_payload_blobs(payload: &[u8], rng: &mut impl RngCore) -> Vec<Vec<u8>> {
-    payload
-        .chunks(USABLE_BYTES_PER_BLOB)
-        .map(|chunk| {
-            let mut blob = random_bytes(rng, BLOB_SIZE);
-            blob[..chunk.len()].copy_from_slice(chunk);
-            blob
+/// A simulator blob paired with the hash embedded in its commitment.
+pub type HashedBlob = ([u8; 32], Vec<u8>);
+/// Execution envelope bytes plus their recoverable payload blobs.
+pub type RecoverablePayload = (Vec<u8>, Vec<HashedBlob>);
+
+/// Generate full, hash-recoverable blob bodies for blocks-in-blobs and form the
+/// exact-size execution envelope from their usable prefixes. The remaining blob
+/// bytes are deterministic random-looking padding from [`payload_for_blob_hash`].
+pub fn recoverable_payload_blobs(
+    exec_payload_size: usize,
+    rng: &mut impl RngCore,
+) -> RecoverablePayload {
+    let blobs: Vec<HashedBlob> = (0..payload_blob_count(exec_payload_size))
+        .map(|_| {
+            let hash: [u8; 32] = random_bytes(rng, 32).try_into().expect("32 random bytes");
+            let blob = payload_for_blob_hash(&hash);
+            (hash, blob)
         })
-        .collect()
+        .collect();
+    let payload = blobs
+        .iter()
+        .flat_map(|(_, blob)| blob[..USABLE_BYTES_PER_BLOB].iter().copied())
+        .take(exec_payload_size)
+        .collect();
+    (payload, blobs)
 }
 
 impl SignedBeaconBlock {
@@ -559,6 +603,11 @@ pub fn blob_hash_from_commitment(commitment: &[u8]) -> Option<[u8; 32]> {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&commitment[1..33]);
     Some(hash)
+}
+
+/// Regenerate the exact blob body named by a simulator hash-bearing commitment.
+pub fn blob_from_commitment(commitment: &[u8]) -> Option<Vec<u8>> {
+    blob_hash_from_commitment(commitment).map(|hash| payload_for_blob_hash(&hash))
 }
 
 /// A growable-length bitmap with one bit per blob slot (Lighthouse's
@@ -724,6 +773,19 @@ impl PartialDataColumnSidecar {
         self.cells_present_bitmap.num_set_bits()
     }
 
+    /// Whether the bitmap and sparse cell/proof vectors form a valid sidecar.
+    /// Wire decoding is intentionally separate from this semantic validation.
+    pub fn is_structurally_valid(&self) -> bool {
+        let present = self.num_present();
+        self.column.len() == present
+            && self.kzg_proofs.len() == present
+            && self.column.iter().all(|cell| cell.len() == BYTES_PER_CELL)
+            && self
+                .kzg_proofs
+                .iter()
+                .all(|proof| proof.len() == KZG_ELEMENT_SIZE)
+    }
+
     /// True when a cell is present for every blob slot.
     pub fn is_complete(&self) -> bool {
         self.cells_present_bitmap.is_full()
@@ -741,6 +803,26 @@ impl PartialDataColumnSidecar {
         self.column
             .get(storage_idx)
             .zip(self.kzg_proofs.get(storage_idx))
+    }
+
+    /// Insert a missing row cell while maintaining sparse row order. Existing
+    /// network-provided cells win over reconstructed data on overlap.
+    pub fn insert_missing(&mut self, idx: usize, cell: Cell, proof: Vec<u8>) -> bool {
+        if !self.is_structurally_valid()
+            || idx >= self.cells_present_bitmap.len()
+            || self.cells_present_bitmap.get(idx)
+            || cell.len() != BYTES_PER_CELL
+            || proof.len() != KZG_ELEMENT_SIZE
+        {
+            return false;
+        }
+        let storage_idx = (0..idx)
+            .filter(|&i| self.cells_present_bitmap.get(i))
+            .count();
+        self.cells_present_bitmap.set(idx);
+        self.column.insert(storage_idx, cell);
+        self.kzg_proofs.insert(storage_idx, proof);
+        true
     }
 
     /// Build a new sidecar containing only the present cells for which
@@ -938,35 +1020,36 @@ mod tests {
     }
 
     #[test]
-    fn payload_blob_encoding_round_trips_payload_with_random_padding() {
+    fn recoverable_payload_blobs_round_trip_and_are_deterministic() {
         let payload_len = USABLE_BYTES_PER_BLOB + 123;
-        let payload = random_bytes(&mut StdRng::seed_from_u64(11), payload_len);
-
         let mut rng = StdRng::seed_from_u64(22);
-        let blobs = encode_payload_blobs(&payload, &mut rng);
+        let (payload, blobs) = recoverable_payload_blobs(payload_len, &mut rng);
 
-        assert_eq!(blobs.len(), payload_blob_count(payload.len()));
-        assert!(blobs.iter().all(|blob| blob.len() == BLOB_SIZE));
+        assert_eq!(payload.len(), payload_len);
+        assert_eq!(blobs.len(), payload_blob_count(payload_len));
+        assert!(blobs.iter().all(|(_, blob)| blob.len() == BLOB_SIZE));
+        assert!(blobs
+            .iter()
+            .all(|(hash, blob)| blob == &payload_for_blob_hash(hash)));
 
         let recovered: Vec<u8> = blobs
             .iter()
-            .flat_map(|blob| blob[..USABLE_BYTES_PER_BLOB].iter().copied())
-            .take(payload.len())
+            .flat_map(|(_, blob)| blob[..USABLE_BYTES_PER_BLOB].iter().copied())
+            .take(payload_len)
             .collect();
         assert_eq!(recovered, payload);
 
-        // Same payload + seed gives reproducible blob bodies, including padding.
         let mut same_rng = StdRng::seed_from_u64(22);
-        assert_eq!(blobs, encode_payload_blobs(&payload, &mut same_rng));
-
-        // The last blob's unused bytes are random-looking padding, not zeros or a
-        // repeated dummy byte that would compress unrealistically well.
-        let last_chunk_len = payload_len - USABLE_BYTES_PER_BLOB;
-        let padding = &blobs[1][last_chunk_len..];
-        assert!(padding.windows(2).any(|w| w[0] != w[1]));
+        assert_eq!(
+            (payload, blobs),
+            recoverable_payload_blobs(payload_len, &mut same_rng)
+        );
 
         let mut empty_rng = StdRng::seed_from_u64(1);
-        assert!(encode_payload_blobs(&[], &mut empty_rng).is_empty());
+        assert_eq!(
+            recoverable_payload_blobs(0, &mut empty_rng),
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]
@@ -996,10 +1079,46 @@ mod tests {
         let commitment = commitment_for_blob_hash(&hash);
         assert_eq!(commitment.len(), KZG_ELEMENT_SIZE);
         assert_eq!(blob_hash_from_commitment(&commitment), Some(hash));
+        let blob = blob_from_commitment(&commitment).expect("recoverable commitment");
+        assert_eq!(blob, payload_for_blob_hash(&hash));
+        for col in [0, 63, 64, 127] {
+            assert_eq!(
+                derive_cell(&blob, col),
+                derive_cell(&payload_for_blob_hash(&hash), col)
+            );
+        }
         // Non-hash-bearing commitments don't decode.
-        assert_eq!(
-            blob_hash_from_commitment(&vec![0xCC; KZG_ELEMENT_SIZE]),
-            None
-        );
+        assert_eq!(blob_hash_from_commitment(&[0xCC; KZG_ELEMENT_SIZE]), None);
+    }
+
+    #[test]
+    fn structural_validation_guards_sparse_vectors() {
+        let cell = vec![0u8; BYTES_PER_CELL];
+        let proof = vec![0xEE; KZG_ELEMENT_SIZE];
+
+        // A well-formed single-cell sidecar validates and inserts.
+        let mut good = PartialDataColumnSidecar::empty(2, None);
+        assert!(good.insert_missing(1, cell.clone(), proof.clone()));
+        assert!(good.is_structurally_valid());
+        assert_eq!(good.num_present(), 1);
+
+        // Bitmap claims a cell the vectors don't carry → invalid, and
+        // insert_missing refuses to touch it.
+        let mut bad_bitmap = CellBitmap::with_len(2);
+        bad_bitmap.set(0);
+        let mut malformed = PartialDataColumnSidecar {
+            cells_present_bitmap: bad_bitmap,
+            column: Vec::new(),
+            kzg_proofs: Vec::new(),
+            header: None,
+        };
+        assert!(!malformed.is_structurally_valid());
+        assert!(!malformed.insert_missing(1, cell.clone(), proof.clone()));
+
+        // Wrong-sized cell/proof are rejected on insert.
+        let mut sized = PartialDataColumnSidecar::empty(1, None);
+        assert!(!sized.insert_missing(0, vec![0u8; BYTES_PER_CELL - 1], proof.clone()));
+        assert!(!sized.insert_missing(0, cell, vec![0xEE; KZG_ELEMENT_SIZE - 1]));
+        assert_eq!(sized.num_present(), 0);
     }
 }

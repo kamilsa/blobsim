@@ -43,6 +43,9 @@ event's message kind is therefore emitted as `mkind`, not `kind`.
 | `readiness` | `is_cl_node`, `is_builder`, `is_zk_attester`, `eligible_envelope`, `eligible_custody`, `n_blobs`, `num_custody_columns`, `cells_held`, `cells_total`, `cl_peers`, `el_peers`, `block_t_ms\|NA`, `envelope_t_ms\|NA`, `custody_complete_t_ms\|NA` | every CL node at the **t=4 s attestation deadline** | §1 (custody count), §3 (cell possession) |
 | `columns_seeded` | `columns`, `n_blobs` | builder, after seeding columns (= blob release) | §4 (release time) |
 | `custody_complete` | — | a CL node the first time its **full custody set** assembles for a slot | §4 (completion time) |
+| `blob_reconstruction_started` | `blob_index`, `generation`, `attempt`, `trigger`, `cells_held`, `complete_columns`, `delay_ms` | reconstruction-enabled non-builder supernode when a row becomes eligible | §4 reconstruction summary |
+| `blob_reconstruction_completed` | `blob_index`, `generation`, `attempt`, `trigger`, `cells_added`, `columns_updated`, `outcome=reconstructed\|already-complete` | reconstruction-enabled non-builder supernode at the delayed deadline | §4 reconstruction summary |
+| `blob_reconstruction_dropped` | `blob_index`, `generation`, `attempt`, `trigger`, `reason=assembly-evicted\|queue-capacity\|simulation-ended` | stale delayed job, bounded-scheduler overflow, or a job still pending at simulation end | §4 reconstruction summary |
 | `traffic` | `layer=<cl\|el>`, `dir=<in\|out>`, `mkind=<msg kind>`, `bytes` | every `record_*` bandwidth call (see below) | §5 (per-message bandwidth) |
 
 `traffic.mkind` values: `block`, `envelope`, `blob_sidecar`, `data_column`,
@@ -52,6 +55,9 @@ per message; the loader falls back to `METRIC` per-slot aggregates when absent.
 partial (`record_partial_received`) and `dir=out` on each publish/re-publish that
 queues cells to peers (`record_partial_sent`) — the outbound side is the dominant
 CL payload under EIP-8070 and must be present for the §5 send totals to be right.
+Cells generated locally by reconstruction do not increment `partial_cells_received`.
+Their re-publication uses the ordinary `partial_column dir=out` traffic path and is
+therefore already included in outbound CL bandwidth.
 
 ## METRIC / SUMMARY lines (`metrics` target)
 

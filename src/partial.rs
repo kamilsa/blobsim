@@ -22,8 +22,10 @@ use libp2p::gossipsub::partial_messages::{Metadata, Partial, PartialAction, Part
 use libp2p::PeerId;
 
 use crate::types::{
+    blob_from_commitment, blob_hash_from_commitment, derive_cell, BlobReconstructionTrigger,
     CellBitmap, DataColumnSidecar, PartialDataColumn, PartialDataColumnHeader,
-    PartialDataColumnPartsMetadata, PartialDataColumnSidecar,
+    PartialDataColumnPartsMetadata, PartialDataColumnSidecar, KZG_ELEMENT_SIZE,
+    NUM_CUSTODY_COLUMNS,
 };
 
 /// Version byte prefixing a partial column group id (`0x00 || block_root`).
@@ -290,11 +292,52 @@ pub struct MergeResult {
 }
 
 /// Per-block assembly state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    Collecting,
+    Reconstructing,
+    Finished,
+    Unrecoverable,
+}
+
+/// Atomic set of rows newly made eligible by one ingestion unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EligibleRows {
+    pub block_root: [u8; 32],
+    pub generation: u64,
+    pub trigger: BlobReconstructionTrigger,
+    pub complete_columns: usize,
+    /// `(blob_index, cells_held_at_start)` in ascending row order.
+    pub rows: Vec<(usize, usize)>,
+}
+
+/// Per-row result of applying a due reconstruction batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedRow {
+    pub blob_index: usize,
+    pub cells_added: usize,
+    pub columns_updated: usize,
+    pub already_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconstructionApply {
+    Stale,
+    Applied {
+        rows: Vec<ReconstructedRow>,
+        changed_columns: Vec<u64>,
+        newly_complete_columns: usize,
+    },
+}
+
 struct BlockAssembly {
+    generation: u64,
     header: Option<PartialDataColumnHeader>,
     /// Current merged partial per column index.
     columns: HashMap<u64, PartialDataColumnSidecar>,
     complete: HashSet<u64>,
+    row_counts: Vec<usize>,
+    row_states: Vec<RowState>,
 }
 
 /// Accumulates received partial columns per block (bounded LRU by block root)
@@ -303,6 +346,7 @@ pub struct PartialColumnAssembler {
     capacity: usize,
     order: VecDeque<[u8; 32]>,
     blocks: HashMap<[u8; 32], BlockAssembly>,
+    next_generation: u64,
 }
 
 impl PartialColumnAssembler {
@@ -311,6 +355,7 @@ impl PartialColumnAssembler {
             capacity: capacity.max(1),
             order: VecDeque::new(),
             blocks: HashMap::new(),
+            next_generation: 1,
         }
     }
 
@@ -322,12 +367,17 @@ impl PartialColumnAssembler {
                 }
             }
             self.order.push_back(block_root);
+            let generation = self.next_generation;
+            self.next_generation = self.next_generation.wrapping_add(1).max(1);
             self.blocks.insert(
                 block_root,
                 BlockAssembly {
+                    generation,
                     header: None,
                     columns: HashMap::new(),
                     complete: HashSet::new(),
+                    row_counts: Vec::new(),
+                    row_states: Vec::new(),
                 },
             );
         }
@@ -338,6 +388,37 @@ impl PartialColumnAssembler {
     pub fn set_header(&mut self, block_root: [u8; 32], header: PartialDataColumnHeader) {
         let block = self.ensure_block(block_root);
         if block.header.is_none() {
+            let rows = header.kzg_commitments.len();
+            // Cells may precede the header, but their bitmap length must agree
+            // with the commitment count before they can participate in a row.
+            block
+                .columns
+                .retain(|_, column| column.cells_present_bitmap.len() == rows);
+            block.complete = block
+                .columns
+                .iter()
+                .filter_map(|(&index, column)| column.is_complete().then_some(index))
+                .collect();
+            block.row_counts = (0..rows)
+                .map(|row| {
+                    block
+                        .columns
+                        .values()
+                        .filter(|column| column.cells_present_bitmap.get(row))
+                        .count()
+                })
+                .collect();
+            block.row_states = block
+                .row_counts
+                .iter()
+                .map(|&count| {
+                    if count >= NUM_CUSTODY_COLUMNS as usize {
+                        RowState::Finished
+                    } else {
+                        RowState::Collecting
+                    }
+                })
+                .collect();
             block.header = Some(header);
         }
     }
@@ -366,21 +447,61 @@ impl PartialColumnAssembler {
     /// Merge a received partial column into the assembly. Records the block's
     /// header if the partial carries one.
     pub fn merge_partial(&mut self, partial: &PartialDataColumn) -> MergeResult {
+        if !partial.sidecar.is_structurally_valid() {
+            return MergeResult {
+                added_cells: 0,
+                newly_complete: None,
+            };
+        }
         if let Some(header) = &partial.sidecar.header {
+            if header.kzg_commitments.len() != partial.sidecar.cells_present_bitmap.len() {
+                return MergeResult {
+                    added_cells: 0,
+                    newly_complete: None,
+                };
+            }
             self.set_header(partial.block_root, header.clone());
         }
         let block = self.ensure_block(partial.block_root);
         let num_blobs = partial.sidecar.cells_present_bitmap.len();
+        if block
+            .header
+            .as_ref()
+            .is_some_and(|header| header.kzg_commitments.len() != num_blobs)
+        {
+            return MergeResult {
+                added_cells: 0,
+                newly_complete: None,
+            };
+        }
 
         let entry = block
             .columns
             .entry(partial.index)
             .or_insert_with(|| PartialDataColumnSidecar::empty(num_blobs, None));
 
+        let new_rows: Vec<usize> = (0..num_blobs)
+            .filter(|&row| {
+                partial.sidecar.cells_present_bitmap.get(row)
+                    && !entry.cells_present_bitmap.get(row)
+            })
+            .collect();
         let before = entry.num_present();
         *entry = entry.merge(&partial.sidecar);
         let after = entry.num_present();
         let added_cells = after.saturating_sub(before);
+        if block.header.is_some() {
+            for row in new_rows {
+                if let Some(count) = block.row_counts.get_mut(row) {
+                    *count += 1;
+                    if *count >= NUM_CUSTODY_COLUMNS as usize {
+                        if let Some(state) = block.row_states.get_mut(row) {
+                            *state = RowState::Finished;
+                        }
+                    }
+                }
+            }
+        }
 
         let newly_complete = if entry.is_complete() && !block.complete.contains(&partial.index) {
             block.complete.insert(partial.index);
@@ -399,6 +520,143 @@ impl PartialColumnAssembler {
         MergeResult {
             added_cells,
             newly_complete,
+        }
+    }
+
+    /// Atomically mark newly eligible rows as reconstructing. Call this only
+    /// after a complete network/local-pool ingestion unit.
+    pub fn take_eligible_rows(
+        &mut self,
+        block_root: [u8; 32],
+        trigger: BlobReconstructionTrigger,
+    ) -> Option<EligibleRows> {
+        let block = self.blocks.get_mut(&block_root)?;
+        let header = block.header.as_ref()?;
+        let complete_columns = block.complete.len();
+        if trigger == BlobReconstructionTrigger::CompleteColumns
+            && complete_columns < crate::types::CELLS_PER_BLOB
+        {
+            return None;
+        }
+        let mut rows = Vec::new();
+        for row in 0..header.kzg_commitments.len() {
+            let count = block.row_counts.get(row).copied().unwrap_or(0);
+            if block.row_states.get(row) != Some(&RowState::Collecting)
+                || count >= NUM_CUSTODY_COLUMNS as usize
+                || (trigger == BlobReconstructionTrigger::PerRow
+                    && count < crate::types::CELLS_PER_BLOB)
+            {
+                continue;
+            }
+            if blob_hash_from_commitment(&header.kzg_commitments[row]).is_none() {
+                block.row_states[row] = RowState::Unrecoverable;
+                continue;
+            }
+            block.row_states[row] = RowState::Reconstructing;
+            rows.push((row, count));
+        }
+        (!rows.is_empty()).then_some(EligibleRows {
+            block_root,
+            generation: block.generation,
+            trigger,
+            complete_columns,
+            rows,
+        })
+    }
+
+    /// Apply a due batch if its generation still names the same assembly.
+    pub fn apply_reconstruction(
+        &mut self,
+        block_root: [u8; 32],
+        generation: u64,
+        rows: &[usize],
+    ) -> ReconstructionApply {
+        let Some(block) = self.blocks.get_mut(&block_root) else {
+            return ReconstructionApply::Stale;
+        };
+        if block.generation != generation {
+            return ReconstructionApply::Stale;
+        }
+        let Some(header) = block.header.as_ref() else {
+            return ReconstructionApply::Stale;
+        };
+        let complete_before = block.complete.len();
+        let mut changed = HashSet::new();
+        let mut results = Vec::new();
+        for &row in rows {
+            if row >= block.row_states.len() {
+                continue;
+            }
+            let already_complete = block.row_counts[row] >= NUM_CUSTODY_COLUMNS as usize;
+            if already_complete {
+                block.row_states[row] = RowState::Finished;
+                results.push(ReconstructedRow {
+                    blob_index: row,
+                    cells_added: 0,
+                    columns_updated: 0,
+                    already_complete: true,
+                });
+                continue;
+            }
+            if block.row_states[row] != RowState::Reconstructing {
+                continue;
+            }
+            let Some(blob) = blob_from_commitment(&header.kzg_commitments[row]) else {
+                block.row_states[row] = RowState::Unrecoverable;
+                continue;
+            };
+            let mut added = 0;
+            for column_index in 0..NUM_CUSTODY_COLUMNS {
+                let sidecar = block.columns.entry(column_index).or_insert_with(|| {
+                    PartialDataColumnSidecar::empty(header.kzg_commitments.len(), None)
+                });
+                if sidecar.insert_missing(
+                    row,
+                    derive_cell(&blob, column_index),
+                    vec![0xEE; KZG_ELEMENT_SIZE],
+                ) {
+                    added += 1;
+                    changed.insert(column_index);
+                    block.row_counts[row] += 1;
+                }
+                if sidecar.is_complete() {
+                    block.complete.insert(column_index);
+                }
+            }
+            block.row_states[row] = RowState::Finished;
+            results.push(ReconstructedRow {
+                blob_index: row,
+                cells_added: added,
+                columns_updated: added,
+                already_complete: false,
+            });
+        }
+        let mut changed_columns: Vec<u64> = changed.into_iter().collect();
+        changed_columns.sort_unstable();
+        ReconstructionApply::Applied {
+            rows: results,
+            changed_columns,
+            newly_complete_columns: block.complete.len().saturating_sub(complete_before),
+        }
+    }
+
+    /// Return rows to collecting when a bounded scheduler cannot retain a job.
+    pub fn release_reconstructing(
+        &mut self,
+        block_root: [u8; 32],
+        generation: u64,
+        rows: &[usize],
+    ) {
+        let Some(block) = self.blocks.get_mut(&block_root) else {
+            return;
+        };
+        if block.generation != generation {
+            return;
+        }
+        for &row in rows {
+            if block.row_states.get(row) == Some(&RowState::Reconstructing) {
+                block.row_states[row] = RowState::Collecting;
+            }
         }
     }
 
@@ -446,5 +704,240 @@ impl PartialColumnAssembler {
             index,
             sidecar,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        commitment_for_blob_hash, payload_for_blob_hash, PartialDataColumnHeader, BYTES_PER_CELL,
+    };
+
+    fn root(n: u8) -> [u8; 32] {
+        let mut root = [0; 32];
+        root[0] = n;
+        root
+    }
+
+    fn setup(capacity: usize, root: [u8; 32], hashes: &[[u8; 32]]) -> PartialColumnAssembler {
+        let mut assembler = PartialColumnAssembler::new(capacity);
+        assembler.set_header(
+            root,
+            PartialDataColumnHeader::from_commitments(
+                hashes.iter().map(commitment_for_blob_hash).collect(),
+            ),
+        );
+        assembler
+    }
+
+    fn merge_rows(
+        assembler: &mut PartialColumnAssembler,
+        root: [u8; 32],
+        column: u64,
+        hashes: &[[u8; 32]],
+        rows: &[usize],
+    ) -> usize {
+        let mut sidecar = PartialDataColumnSidecar::empty(hashes.len(), None);
+        for &row in rows {
+            sidecar.insert_missing(
+                row,
+                derive_cell(&payload_for_blob_hash(&hashes[row]), column),
+                vec![0xEE; KZG_ELEMENT_SIZE],
+            );
+        }
+        assembler
+            .merge_partial(&PartialDataColumn {
+                block_root: root,
+                index: column,
+                sidecar,
+            })
+            .added_cells
+    }
+
+    #[test]
+    fn counts_only_new_cells_and_complete_columns_triggers_at_64() {
+        let hashes = [[1; 32], [2; 32]];
+        let block = root(1);
+        let mut assembler = setup(4, block, &hashes);
+        let malformed = PartialDataColumn {
+            block_root: block,
+            index: 127,
+            sidecar: PartialDataColumnSidecar::empty(3, None),
+        };
+        assert_eq!(assembler.merge_partial(&malformed).added_cells, 0);
+        assert!(assembler.current_partial(&block, 127).is_none());
+        for column in 0..63 {
+            assert_eq!(
+                merge_rows(&mut assembler, block, column, &hashes, &[0, 1]),
+                2
+            );
+        }
+        assert_eq!(merge_rows(&mut assembler, block, 0, &hashes, &[0, 1]), 0);
+        assert!(assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::CompleteColumns)
+            .is_none());
+        merge_rows(&mut assembler, block, 63, &hashes, &[0, 1]);
+        let batch = assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::CompleteColumns)
+            .expect("64 complete columns trigger all rows");
+        assert_eq!(batch.rows, vec![(0, 64), (1, 64)]);
+        assert!(assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::CompleteColumns)
+            .is_none());
+    }
+
+    #[test]
+    fn per_row_batches_can_start_independently_and_reconstruct_exact_cells() {
+        let hashes = [[3; 32], [4; 32]];
+        let block = root(2);
+        let mut assembler = setup(4, block, &hashes);
+        for column in 0..64 {
+            merge_rows(&mut assembler, block, column, &hashes, &[0]);
+        }
+        let first = assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::PerRow)
+            .expect("first row eligible");
+        assert_eq!(first.rows, vec![(0, 64)]);
+        for column in 0..64 {
+            merge_rows(&mut assembler, block, column, &hashes, &[1]);
+        }
+        let second = assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::PerRow)
+            .expect("second row eligible later");
+        assert_eq!(second.rows, vec![(1, 64)]);
+
+        let ReconstructionApply::Applied { rows, .. } =
+            assembler.apply_reconstruction(block, first.generation, &[0])
+        else {
+            panic!("current generation");
+        };
+        assert_eq!(rows[0].cells_added, 64);
+        for column in 0..NUM_CUSTODY_COLUMNS {
+            let partial = assembler.current_partial(&block, column).unwrap();
+            assert_eq!(
+                partial.sidecar.get(0).unwrap().0,
+                &derive_cell(&payload_for_blob_hash(&hashes[0]), column)
+            );
+        }
+    }
+
+    #[test]
+    fn late_cells_are_preserved_and_natural_completion_adds_zero() {
+        let hashes = [[5; 32]];
+        let block = root(3);
+        let mut assembler = setup(4, block, &hashes);
+        for column in 0..64 {
+            merge_rows(&mut assembler, block, column, &hashes, &[0]);
+        }
+        let batch = assembler
+            .take_eligible_rows(block, BlobReconstructionTrigger::PerRow)
+            .unwrap();
+        for column in 64..NUM_CUSTODY_COLUMNS {
+            merge_rows(&mut assembler, block, column, &hashes, &[0]);
+        }
+        let ReconstructionApply::Applied {
+            rows,
+            changed_columns,
+            ..
+        } = assembler.apply_reconstruction(block, batch.generation, &[0])
+        else {
+            panic!("current generation");
+        };
+        assert!(rows[0].already_complete);
+        assert_eq!(rows[0].cells_added, 0);
+        assert!(changed_columns.is_empty());
+        assert_eq!(assembler.custody_possession(&block, &[0]).0, 1);
+        assert_eq!(
+            assembler.current_partial(&block, 0).unwrap().sidecar.column[0].len(),
+            BYTES_PER_CELL
+        );
+    }
+
+    #[test]
+    fn stale_generation_and_multiple_roots_are_isolated() {
+        let hashes = [[6; 32]];
+        let mut assembler = setup(1, root(4), &hashes);
+        for column in 0..64 {
+            merge_rows(&mut assembler, root(4), column, &hashes, &[0]);
+        }
+        let old = assembler
+            .take_eligible_rows(root(4), BlobReconstructionTrigger::PerRow)
+            .unwrap();
+        assembler.set_header(
+            root(5),
+            PartialDataColumnHeader::from_commitments(vec![commitment_for_blob_hash(&hashes[0])]),
+        );
+        assembler.set_header(
+            root(4),
+            PartialDataColumnHeader::from_commitments(vec![commitment_for_blob_hash(&hashes[0])]),
+        );
+        assert_eq!(
+            assembler.apply_reconstruction(root(4), old.generation, &[0]),
+            ReconstructionApply::Stale
+        );
+        assert!(assembler.current_partial(&root(4), 0).is_none());
+    }
+
+    #[test]
+    fn structurally_invalid_partial_is_not_merged() {
+        let hashes = [[7; 32]];
+        let block = root(7);
+        let mut assembler = setup(4, block, &hashes);
+        // Bitmap claims a present cell, but the sparse vectors are empty.
+        let malformed = PartialDataColumn {
+            block_root: block,
+            index: 0,
+            sidecar: PartialDataColumnSidecar {
+                cells_present_bitmap: {
+                    let mut b = CellBitmap::with_len(1);
+                    b.set(0);
+                    b
+                },
+                column: Vec::new(),
+                kzg_proofs: Vec::new(),
+                header: None,
+            },
+        };
+        assert_eq!(assembler.merge_partial(&malformed).added_cells, 0);
+        // Neither the column nor the row count advanced from the bogus bitmap.
+        assert!(assembler.current_partial(&block, 0).is_none());
+        assert_eq!(assembler.custody_possession(&block, &[0]).0, 0);
+    }
+
+    #[test]
+    fn malformed_header_does_not_poison_block() {
+        let hash = [8; 32];
+        let block = root(8);
+        let mut assembler = PartialColumnAssembler::new(4);
+        let malformed = PartialDataColumn {
+            block_root: block,
+            index: 0,
+            sidecar: PartialDataColumnSidecar::empty(
+                1,
+                Some(PartialDataColumnHeader::from_commitments(vec![
+                    commitment_for_blob_hash(&hash),
+                    commitment_for_blob_hash(&hash),
+                ])),
+            ),
+        };
+        assert_eq!(assembler.merge_partial(&malformed).added_cells, 0);
+        assert!(assembler.get_header(&block).is_none());
+
+        let valid = PartialDataColumn {
+            block_root: block,
+            index: 0,
+            sidecar: PartialDataColumnSidecar::empty(
+                1,
+                Some(PartialDataColumnHeader::from_commitments(vec![
+                    commitment_for_blob_hash(&hash),
+                ])),
+            ),
+        };
+        assert_eq!(assembler.merge_partial(&valid).added_cells, 0);
+        assert_eq!(
+            assembler.get_header(&block).unwrap().kzg_commitments.len(),
+            1
+        );
     }
 }
