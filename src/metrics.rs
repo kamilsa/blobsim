@@ -61,14 +61,29 @@ pub struct BandwidthMetrics {
     partial_cells_received: u64,
     /// Data columns published/seeded via the partial protocol.
     partial_columns_published: u64,
-    /// Payload bytes (partial body + metadata) sent to peers via the partial
-    /// protocol — the outbound counterpart of `partial_cells_received`.
+    /// Wire-level partial-message bytes (body + metadata) accepted into peer
+    /// send queues this slot, from diffing the behaviour's cumulative counters.
     partial_bytes_sent: u64,
+    /// Wire-level partial-message bytes (body + metadata) received this slot,
+    /// including redundant/filtered messages `Event::Partial` never surfaces.
+    partial_bytes_received: u64,
+    /// Wire-level partial-message RPCs accepted into peer send queues this slot.
+    partial_wire_msgs_sent: u64,
+    /// Wire-level partial-message RPCs received this slot (compare against
+    /// `partial_messages_received`, the surfaced-event count, for redundancy).
+    partial_wire_msgs_received: u64,
     /// Columns that assembled to completion this slot.
     partial_columns_completed: u64,
     /// Custody cells received over EL and stored as partial blob data in the
     /// local EL blob pool (the getBlobsV4 sparse-blobpool path).
     partial_cells_pooled: u64,
+
+    // -- Previous snapshot of the gossipsub behaviour's cumulative partial
+    // -- traffic counters (never reset; used to compute per-slot deltas) --
+    prev_partial_tx_bytes: u64,
+    prev_partial_tx_msgs: u64,
+    prev_partial_rx_bytes: u64,
+    prev_partial_rx_msgs: u64,
 
     // -- Cumulative totals --
     total_el_bytes_sent: u64,
@@ -101,8 +116,15 @@ impl BandwidthMetrics {
             partial_cells_received: 0,
             partial_columns_published: 0,
             partial_bytes_sent: 0,
+            partial_bytes_received: 0,
+            partial_wire_msgs_sent: 0,
+            partial_wire_msgs_received: 0,
             partial_columns_completed: 0,
             partial_cells_pooled: 0,
+            prev_partial_tx_bytes: 0,
+            prev_partial_tx_msgs: 0,
+            prev_partial_rx_bytes: 0,
+            prev_partial_rx_msgs: 0,
             total_el_bytes_sent: 0,
             total_el_bytes_received: 0,
             total_cl_bytes_sent: 0,
@@ -209,39 +231,66 @@ impl BandwidthMetrics {
         self.emit_traffic("el", "in", "announce", bytes);
     }
 
-    /// Record a partial data-column message received via `Event::Partial`. The
-    /// payload + metadata bytes count as inbound CL bandwidth; `new_cells` is how
-    /// many previously-missing cells it delivered; `has_header` flags a phase-1
-    /// header-only message.
-    pub fn record_partial_received(&mut self, bytes: usize, new_cells: usize, has_header: bool) {
-        self.cl_bytes_received += bytes as u64;
+    /// Record a partial data-column message surfaced via `Event::Partial` — the
+    /// useful-goodput signal. Bytes are NOT booked here: the event stream only
+    /// carries messages whose content we needed, so byte-level bandwidth comes
+    /// from the wire counters via
+    /// [`record_partial_traffic`](Self::record_partial_traffic). `new_cells` is
+    /// how many previously-missing cells the message delivered; `has_header`
+    /// flags a phase-1 header-only message.
+    pub fn record_partial_received(&mut self, new_cells: usize, has_header: bool) {
         self.partial_messages_received += 1;
         self.partial_cells_received += new_cells as u64;
         if has_header {
             self.partial_headers_received += 1;
         }
-        self.emit_traffic("cl", "in", "partial_column", bytes);
     }
 
     /// Record that we seeded a distinct data column via the partial protocol
-    /// (a counter only). Outbound bytes are accounted separately via
-    /// [`record_partial_sent`](Self::record_partial_sent), since the actual publish
-    /// may happen in a following re-publish call rather than here.
+    /// (a counter only; bytes come from
+    /// [`record_partial_traffic`](Self::record_partial_traffic)).
     pub fn record_partial_column_published(&mut self) {
         self.partial_columns_published += 1;
     }
 
-    /// Account outbound partial-message bandwidth (body + metadata bytes queued to
-    /// peers) as CL send traffic. Used by every publish / re-publish path (seed,
-    /// cell-delta cross-fill, repair). A zero-byte publish (metadata-only "poke"
-    /// with no recipient needing data) is a no-op.
-    pub fn record_partial_sent(&mut self, bytes: usize) {
-        if bytes == 0 {
-            return;
+    /// Book the per-slot delta of the gossipsub behaviour's cumulative
+    /// partial-message wire counters (`Behaviour::partial_traffic`) as CL
+    /// bandwidth. Counted at the RPC layer, this covers every send path
+    /// (publish, cross-fill replies, heartbeat gossip) and every received
+    /// message including redundant deliveries the extension filters before
+    /// `Event::Partial` — unlike the app-level events, in/out are symmetric
+    /// network-wide. Call once per slot, before `emit_slot_summary`.
+    pub fn record_partial_traffic(
+        &mut self,
+        tx_bytes: u64,
+        tx_msgs: u64,
+        rx_bytes: u64,
+        rx_msgs: u64,
+    ) {
+        let d_tx_bytes = tx_bytes.saturating_sub(self.prev_partial_tx_bytes);
+        let d_tx_msgs = tx_msgs.saturating_sub(self.prev_partial_tx_msgs);
+        let d_rx_bytes = rx_bytes.saturating_sub(self.prev_partial_rx_bytes);
+        let d_rx_msgs = rx_msgs.saturating_sub(self.prev_partial_rx_msgs);
+        self.prev_partial_tx_bytes = tx_bytes;
+        self.prev_partial_tx_msgs = tx_msgs;
+        self.prev_partial_rx_bytes = rx_bytes;
+        self.prev_partial_rx_msgs = rx_msgs;
+
+        self.cl_bytes_sent += d_tx_bytes;
+        self.partial_bytes_sent += d_tx_bytes;
+        self.partial_wire_msgs_sent += d_tx_msgs;
+        self.cl_bytes_received += d_rx_bytes;
+        self.partial_bytes_received += d_rx_bytes;
+        self.partial_wire_msgs_received += d_rx_msgs;
+
+        // One aggregated per-slot traffic event per direction (§5 sums by
+        // slot/dir/kind, so aggregation is lossless there).
+        if d_tx_bytes > 0 {
+            self.emit_traffic("cl", "out", "partial_column", d_tx_bytes as usize);
         }
-        self.cl_bytes_sent += bytes as u64;
-        self.partial_bytes_sent += bytes as u64;
-        self.emit_traffic("cl", "out", "partial_column", bytes);
+        if d_rx_bytes > 0 {
+            self.emit_traffic("cl", "in", "partial_column", d_rx_bytes as usize);
+        }
     }
 
     /// Record that a data column assembled to completion.
@@ -269,7 +318,8 @@ impl BandwidthMetrics {
              gossip_sent={} gossip_received={} gossip_forwarded={} \
              partial_msgs_received={} partial_headers_received={} \
              partial_cells_received={} partial_columns_published={} \
-             partial_bytes_sent={} \
+             partial_bytes_sent={} partial_bytes_received={} \
+             partial_wire_msgs_sent={} partial_wire_msgs_received={} \
              partial_columns_completed={} partial_cells_pooled={}",
             slot,
             self.roles_label,
@@ -291,6 +341,9 @@ impl BandwidthMetrics {
             self.partial_cells_received,
             self.partial_columns_published,
             self.partial_bytes_sent,
+            self.partial_bytes_received,
+            self.partial_wire_msgs_sent,
+            self.partial_wire_msgs_received,
             self.partial_columns_completed,
             self.partial_cells_pooled,
         );
@@ -320,6 +373,9 @@ impl BandwidthMetrics {
         self.partial_cells_received = 0;
         self.partial_columns_published = 0;
         self.partial_bytes_sent = 0;
+        self.partial_bytes_received = 0;
+        self.partial_wire_msgs_sent = 0;
+        self.partial_wire_msgs_received = 0;
         self.partial_columns_completed = 0;
         self.partial_cells_pooled = 0;
     }

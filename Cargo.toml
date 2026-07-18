@@ -26,14 +26,18 @@ path = "src/main.rs"
 #       b. `handle_publish` no longer early-returns when republished metadata is
 #          unchanged; upstream's "stale data" skip silently dropped custody
 #          re-advertisements to peers whose view of us had expired.
-#       c. `publish_partial` returns the bytes it queued to peers, so outbound
-#          partial bandwidth can be accounted (see `record_partial_sent` in
-#          src/metrics.rs) -- the behaviour emits no outbound partial event.
+#       c. `publish_partial` returns the bytes it queued to peers (successfully
+#          queued only), and `Behaviour::partial_traffic()` exposes cumulative
+#          wire-level tx/rx counters for partial-message RPCs, counted at the
+#          send-queue/RPC layer so both directions are symmetric (Event::Partial
+#          only surfaces "needed" messages and misses redundant deliveries).
+#          Blob-sim diffs these counters once per slot (see
+#          `record_partial_traffic` in src/metrics.rs).
 #
 # To re-sync onto a newer upstream rev: rebase `blobsim-patches` onto it, push,
 # and bump the `rev` below.
 [dependencies]
-libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "519dfb55bb130728cb06a915a964bbfeca6fd22c", features = [
+libp2p = { git = "https://github.com/kamilsa/rust-libp2p", rev = "9e19ac3204d8ad3392fcdbae952fe8691291a6ae", features = [
     "gossipsub",
     "gossipsub-partial-messages",
     "quic",

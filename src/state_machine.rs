@@ -712,7 +712,7 @@ pub async fn run_node(
                 &mut el_blob_pool,
             )
             .await;
-            readvertise_incomplete_custody_columns(swarm, &mut partial_state, metrics);
+            readvertise_incomplete_custody_columns(swarm, &mut partial_state);
         }
 
         // Drain events until t=12s (slot boundary)
@@ -729,7 +729,12 @@ pub async fn run_node(
         )
         .await;
 
-        // Emit per-slot bandwidth summary
+        // Book this slot's partial-message wire traffic (all send paths and all
+        // received RPCs, including redundant deliveries the extension filters
+        // before `Event::Partial`) from the behaviour's cumulative counters,
+        // then emit the per-slot bandwidth summary.
+        let wire = swarm.behaviour().gossipsub.partial_traffic();
+        metrics.record_partial_traffic(wire.tx_bytes, wire.tx_msgs, wire.rx_bytes, wire.rx_msgs);
         metrics.emit_slot_summary(slot);
 
         let cl_peers = swarm.connected_peers().count();
@@ -993,7 +998,7 @@ fn process_due_reconstructions(
         let mut columns: Vec<_> = columns.into_iter().collect();
         columns.sort_unstable();
         for column in columns {
-            republish_partial_column(swarm, partial_state, block_root, column, metrics);
+            republish_partial_column(swarm, partial_state, block_root, column);
         }
     }
     for block_root in affected_blocks {
@@ -1096,16 +1101,14 @@ fn handle_swarm_event(
             message,
             metadata,
         })) => {
-            let meta_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let subnet = subnet_from_topic(topic_hash.as_str());
             match (subnet, message) {
                 (Some(subnet), Some(msg)) => {
-                    let bytes = msg.len() + meta_bytes;
                     match decode_partial(subnet, &group_id, &msg) {
                         Ok(column) => {
                             let has_header = column.sidecar.header.is_some();
                             let result = partial_state.assembler.merge_partial(&column);
-                            metrics.record_partial_received(bytes, result.added_cells, has_header);
+                            metrics.record_partial_received(result.added_cells, has_header);
                             debug!(
                                 subnet,
                                 index = column.index,
@@ -1159,7 +1162,6 @@ fn handle_swarm_event(
                                     partial_state,
                                     column.block_root,
                                     column.index,
-                                    metrics,
                                 );
                             }
                             // May have just completed our full custody set (§4).
@@ -1174,11 +1176,10 @@ fn handle_swarm_event(
                         }
                     }
                 }
-                // Metadata-only exchange (no payload): account the metadata bytes.
+                // Metadata-only exchange (no payload). Bytes are booked via the
+                // wire counters; this only counts the surfaced event.
                 (Some(subnet), None) => {
-                    if meta_bytes > 0 {
-                        metrics.record_partial_received(meta_bytes, 0, false);
-                    }
+                    metrics.record_partial_received(0, false);
                     // A metadata-only message is the extension's "poke" after its
                     // ~3.5s state TTL wiped a peer's view of us (e.g. the builder's
                     // post-seed advertisement on subnets where the block header was
@@ -1191,13 +1192,7 @@ fn handle_swarm_event(
                             subnet,
                             metadata.as_deref(),
                         ) {
-                            republish_partial_column(
-                                swarm,
-                                partial_state,
-                                block_root,
-                                subnet,
-                                metrics,
-                            );
+                            republish_partial_column(swarm, partial_state, block_root, subnet);
                         }
                     }
                 }
@@ -1734,7 +1729,7 @@ fn ensure_custody_columns(
             if first_time && partial.sidecar.num_present() > 0 {
                 metrics.record_partial_column_published();
             }
-            republish_partial_column(swarm, partial_state, block_root, index, metrics);
+            republish_partial_column(swarm, partial_state, block_root, index);
         }
     }
     if pool_cells_added > 0 {
@@ -1801,10 +1796,7 @@ fn publish_column_partial(
         .gossipsub
         .publish_partial(topic.hash(), outgoing)
     {
-        Ok(bytes) => {
-            metrics.record_partial_column_published();
-            metrics.record_partial_sent(bytes);
-        }
+        Ok(_) => metrics.record_partial_column_published(),
         Err(e) => debug!(index, error = %e, "publish_partial failed"),
     }
 }
@@ -1817,7 +1809,6 @@ fn republish_partial_column(
     partial_state: &mut PartialState,
     block_root: [u8; 32],
     index: u64,
-    metrics: &mut BandwidthMetrics,
 ) {
     let Some(header) = partial_state.assembler.get_header(&block_root) else {
         return;
@@ -1832,16 +1823,13 @@ fn republish_partial_column(
     let outgoing =
         OutgoingPartialColumn::new(Arc::new(partial), &header, header_sent, request_cells);
     let topic = data_column_topic(subnet_for_column(index));
-    // Re-publish serves our accumulated cells (and re-advertises requests) to peers;
-    // account the payload it queues as outbound CL bandwidth, but without counting a
-    // new published column (this column was already counted at first publish).
-    if let Ok(bytes) = swarm
+    // Re-publish serves our accumulated cells (and re-advertises requests) to
+    // peers; the bytes it queues are booked once per slot from the behaviour's
+    // wire counters (`record_partial_traffic`).
+    let _ = swarm
         .behaviour_mut()
         .gossipsub
-        .publish_partial(topic.hash(), outgoing)
-    {
-        metrics.record_partial_sent(bytes);
-    }
+        .publish_partial(topic.hash(), outgoing);
 }
 
 /// Parse the block root out of a partial group id (`0x00 || block_root`).
@@ -1940,7 +1928,6 @@ fn partial_repair_needed(
 fn readvertise_incomplete_custody_columns(
     swarm: &mut Swarm<SimBehaviour>,
     partial_state: &mut PartialState,
-    metrics: &mut BandwidthMetrics,
 ) {
     if !partial_state.enabled {
         return;
@@ -1964,7 +1951,7 @@ fn readvertise_incomplete_custody_columns(
                 .map(|partial| !partial.sidecar.is_complete())
                 .unwrap_or(true);
             if incomplete {
-                republish_partial_column(swarm, partial_state, block_root, index, metrics);
+                republish_partial_column(swarm, partial_state, block_root, index);
             }
         }
     }
